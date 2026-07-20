@@ -1,6 +1,12 @@
 # protestchat
 
-Off-grid messaging for internet shutdowns and jammed protests. Phones talk directly to each other over Bluetooth LE and Wi-Fi Direct — no cell tower, no ISP, no server, no account.
+<p align="center">
+  <img src="docs/banner.jpg" alt="protestchat on a phone, connected to another phone nearby over Bluetooth with the internet off" width="340">
+</p>
+
+<p align="center"><em>connected to a nearby phone — no internet, no tower, no server.</em></p>
+
+Off-grid messaging for internet shutdowns and jammed protests. Phones talk directly to each other over Bluetooth — no cell tower, no ISP, no server, no account.
 
 Built after Delhi Police deployed portable cellular jammers at Jantar Mantar on 20 July 2026 alongside an unpublished mobile internet restriction. **Those jammers target 3G/4G/5G only.** 2.4 GHz is untouched, so two phones standing next to each other were still perfectly capable of talking — there was just no user-friendly & acessible app to do it.
 
