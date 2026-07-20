@@ -15,13 +15,13 @@
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FlatList, StyleSheet, Text, View } from 'react-native';
+import { KeyboardStickyView } from 'react-native-keyboard-controller';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { MessageBubble, groupsWithPrevious } from '@/components/message-bubble';
 import { ModeNotice } from '@/components/mode-notice';
 import { Button, Empty, Input } from '@/components/ui';
 import { Spacing, Type } from '@/constants/theme';
-import { useKeyboardHeight } from '@/hooks/use-keyboard-height';
 import { useTheme } from '@/hooks/use-theme';
 import { useApp } from '@/lib/app-state';
 import { describeConversation, type ConversationInfo } from '@/lib/conversation';
@@ -99,7 +99,6 @@ export default function ChatScreen() {
   };
 
   const danger = info.mode === 'public';
-  const keyboardHeight = useKeyboardHeight();
 
   return (
     <View style={{ flex: 1, backgroundColor: t.bg }}>
@@ -166,38 +165,42 @@ export default function ChatScreen() {
         </Text>
       )}
 
-      <View
-        style={[
-          styles.composer,
-          {
-            backgroundColor: t.bg,
-            // When the keyboard is up it covers the home indicator, so the
-            // composer lifts by exactly the keyboard height and drops the
-            // safe-area inset it no longer needs. When it is down, the inset
-            // (or a minimum) keeps the composer off the home indicator.
-            paddingBottom: keyboardHeight > 0 ? keyboardHeight : insets.bottom || Spacing.lg,
-            // In public broadcast the rule above the keyboard is red too. By the
-            // time the keyboard is up the warning band has scrolled out of the
-            // user's attention even though it is still on screen, and this is
-            // the one moment where being reminded still changes the outcome.
-            borderTopColor: danger ? t.tone.danger.fill : t.border,
-            borderTopWidth: danger ? 2 : StyleSheet.hairlineWidth,
-          },
-        ]}>
-        <Input
-          value={draft}
-          onChangeText={setDraft}
-          placeholder={placeholderFor(info, group?.members.length ?? 0, contact?.name)}
-          multiline
-          style={{ flex: 1, maxHeight: 132 }}
-        />
-        <Button
-          title="Send"
-          onPress={onSend}
-          disabled={!draft.trim() || sending}
-          style={{ paddingHorizontal: Spacing.lg }}
-        />
-      </View>
+      {/* KeyboardStickyView pins the composer to the top of the keyboard. It
+          reads the native IME inset animation directly, so unlike
+          KeyboardAvoidingView it is not thrown off by the edge-to-edge window
+          or the navigation header. `opened: insets.bottom` cancels the resting
+          safe-area padding once the keyboard covers the home indicator, so the
+          input sits flush on the keys rather than floating a gap above them. */}
+      <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
+        <View
+          style={[
+            styles.composer,
+            {
+              backgroundColor: t.bg,
+              paddingBottom: insets.bottom || Spacing.lg,
+              // In public broadcast the rule above the keyboard is red too. By
+              // the time the keyboard is up the warning band has scrolled out of
+              // the user's attention even though it is still on screen, and this
+              // is the one moment where being reminded still changes the outcome.
+              borderTopColor: danger ? t.tone.danger.fill : t.border,
+              borderTopWidth: danger ? 2 : StyleSheet.hairlineWidth,
+            },
+          ]}>
+          <Input
+            value={draft}
+            onChangeText={setDraft}
+            placeholder={placeholderFor(info, group?.members.length ?? 0, contact?.name)}
+            multiline
+            style={{ flex: 1, maxHeight: 132 }}
+          />
+          <Button
+            title="Send"
+            onPress={onSend}
+            disabled={!draft.trim() || sending}
+            style={{ paddingHorizontal: Spacing.lg }}
+          />
+        </View>
+      </KeyboardStickyView>
     </View>
   );
 }

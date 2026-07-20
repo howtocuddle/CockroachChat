@@ -1,5 +1,6 @@
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { Colors, Type } from '@/constants/theme';
@@ -12,7 +13,12 @@ export default function RootLayout() {
 
   return (
     <SafeAreaProvider>
-      <AppProvider>
+      {/* KeyboardProvider reads the real IME window-inset animation natively.
+          Under Android edge-to-edge the window does not resize and the RN
+          Keyboard JS events do not reliably report the IME, so this is the only
+          thing that actually moves the composer above the keyboard. */}
+      <KeyboardProvider>
+        <AppProvider>
         <StatusBar style={isDark ? 'light' : 'dark'} />
         <Stack
           screenOptions={{
@@ -52,7 +58,8 @@ export default function RootLayout() {
           />
           <Stack.Screen name="settings" options={{ title: 'Settings' }} />
         </Stack>
-      </AppProvider>
+        </AppProvider>
+      </KeyboardProvider>
     </SafeAreaProvider>
   );
 }
