@@ -4,7 +4,7 @@
   <img src="docs/banner.jpg" alt="protestchat on a phone, connected to another phone nearby over Bluetooth with the internet off" width="340">
 </p>
 
-<p align="center"><em>connected to a nearby phone — no internet, no tower, no server.</em></p>
+<p align="center"><em>connected to a nearby phone — no internet, no tower, no server required.</em></p>
 
 Off-grid messaging for internet shutdowns and jammed protests. Phones talk directly to each other over Bluetooth — no cell tower, no ISP, no server, no account.
 
