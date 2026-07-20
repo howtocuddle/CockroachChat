@@ -526,8 +526,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.xs,
   },
   empty: {
-    paddingVertical: Spacing.xxl,
-    paddingHorizontal: Spacing.lg,
+    // Sized to sit comfortably inside a Card without doubling its padding, and
+    // to still feel deliberate when used standalone in an empty conversation.
+    paddingVertical: Spacing.lg,
+    paddingHorizontal: Spacing.sm,
     alignItems: 'center',
   },
 });
