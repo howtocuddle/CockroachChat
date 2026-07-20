@@ -15,7 +15,7 @@ They are not a security expert. They are probably stressed, possibly moving, and
 | # | Adversary | Capability | Our answer |
 |---|---|---|---|
 | A1 | Network operator / state | Orders a regional internet suspension | Never touch the internet. Device-to-device only. |
-| A2 | Police with a portable jammer | Denies 3G/4G/5G in a radius | Operate on 2.4 GHz BLE / Wi-Fi Direct, which those jammers do not target |
+| A2 | Police with a portable jammer | Denies 3G/4G/5G in a radius | Operate on 2.4 GHz BLE, which those jammers do not target |
 | A3 | Passive radio observer in the crowd | Records all BLE traffic | Payloads sealed; no sender, recipient, or content on the wire; sizes padded to buckets |
 | A4 | Malicious participant | Runs the app, is a legitimate mesh peer, relays everything | Cannot decrypt what they relay; cannot attribute it; cannot forge a sender |
 | A5 | Someone who hands you a fake contact code | Attempts MITM at introduction | In-person safety-number comparison; contact shown as **Unverified** until done |
@@ -85,12 +85,14 @@ Three deliberate choices:
 | Group size | Hidden by jittered fan-out injection (0–3 s) |
 | Conversation mode | Hidden — direct and channel layouts differ only in length, and there is no discriminator byte on the wire |
 | Envelope id | Random, unlinkable to sender or recipient |
-| **BLE endpoint id** | **Not yet rotated — see open problems** |
+| BLE advertising tag | Rotated every 15 min from fresh CSPRNG bytes, not derivable across rotations. No name and no key material is ever advertised. |
 
 ## Open problems
 
 1. **Forward secrecy.** As above. The most valuable thing a cryptographer could help with.
-2. **Rotating endpoint identifiers.** A stable BLE identifier is a tracking beacon. The COVID exposure-notification schemes solved a very similar problem; that design should probably be adapted here.
+2. **Rotating endpoint identifiers — largely addressed, unverified on hardware.** This was the single strongest reason to drop Google Nearby, which gave no control over its advertisement. We now own the radio (`modules/ble-mesh`) and rotate the advertised tag every 15 minutes from fresh CSPRNG bytes, with no counter or hash chain linking one to the next, and no display name or key material in the advertisement at all. Peer identity is established in-band via HELLO instead.
+
+   What remains unproven: whether stopping and restarting advertising actually prompts each OS to re-randomise the link-layer BLE address. That is the only lever an app has, and it is not a guarantee. **Someone with a BLE sniffer and two phones could settle this in an afternoon, and it would be a genuinely valuable contribution.**
 3. **Sybil resistance.** Identities are free, so per-identity rate limits are worthless. One device can present as hundreds and flood the mesh. Candidates: proof-of-work on send, web-of-trust relay budgets. Unsolved.
 4. **iOS background operation.** iOS suspends BLE aggressively. A relay that only works with the screen on is a much weaker relay.
 5. **Duress / decoy mode.** Panic wipe exists; a duress PIN opening a plausible decoy does not.
@@ -98,6 +100,10 @@ Three deliberate choices:
 7. **Channel passphrase strength.** No strength meter, no enforced minimum. At a protest passphrases spread by shouting and will be weak.
 
 ## Fixed
+
+- **Android auto-backup was uploading the message database (found 20 Jul 2026).** `allowBackup` defaulted to true, so Android's automatic backup would copy the SQLite database — every message, contact and channel key — to the user's Google Drive. That silently recreated the exact thing this design exists to avoid: a copy on a third-party server, subject to subpoena, outliving the 6-hour TTL and surviving a panic wipe. Now `allowBackup: false` in `app.json`.
+
+- **Google Nearby Connections removed as the transport (20 Jul 2026).** On iOS it only ever brings up the Wi-Fi LAN medium, requiring both phones to already share a Wi-Fi network — no use whatsoever in a jammed square with no infrastructure. Replaced with our own CoreBluetooth / BLE GATT transport, which also made identifier rotation possible for the first time (see open problem 2).
 
 - **Unauthenticated TTL (found 20 Jul 2026).** The outer header is unauthenticated by necessity — relays mutate `hopCount` and cannot verify a signature sealed inside the ciphertext — so a hostile relay could rewrite `ttlSeconds` upward and make every phone in the mesh hoard a message far past its sender's intent, defeating the expiry defence above. Fixed without cryptography: each device now caps retention from *first sight* (`MAX_LOCAL_RETENTION_MS` in `db.ts`), which an attacker cannot forge.
 

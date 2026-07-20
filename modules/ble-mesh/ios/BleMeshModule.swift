@@ -15,6 +15,19 @@
 // GATT central (scanning + connecting). There is no client/server role in a
 // mesh. Two devices will frequently connect to each other in both directions at
 // once; `resolveDuplicateLinks` picks one deterministically so both sides agree.
+//
+// FILE LAYOUT — why the radio is not the Module
+//
+// Expo's `Module` base class is a plain Swift class, not an NSObject subclass,
+// and its initialiser is `required public init(appContext:)` marked unavailable
+// for override. All three CoreBluetooth delegate protocols inherit
+// `NSObjectProtocol`, which Swift will not let a non-NSObject class adopt
+// ("cannot declare conformance to 'NSObjectProtocol' in Swift"). So the radio
+// lives in `BleMeshRadio: NSObject`, which owns both managers, the link table
+// and every delegate callback, and `BleMeshModule: Module` is a thin shell that
+// holds one radio, forwards the AsyncFunctions and turns the radio's event
+// callback into `sendEvent`. The radio therefore never imports Expo's event
+// plumbing and can be reasoned about (or ported) on its own.
 
 import CoreBluetooth
 import ExpoModulesCore
@@ -45,9 +58,27 @@ private enum Wire {
   static let helloTimeout: TimeInterval = 10
   static let peerStale: TimeInterval = 30
 
+  /// How many tag bytes we put in *our own* advertisement, as hex.
+  ///
+  /// A BLE advertisement is 31 bytes. Flags cost 3 and a 128-bit service UUID
+  /// costs 18, leaving 10 — and `CBAdvertisementDataLocalNameKey` spends 2 of
+  /// those on its own AD header. Four bytes of tag is eight hex characters,
+  /// which is exactly the remaining budget with nothing to spare: any field iOS
+  /// decides to add for its own reasons truncates the name silently. Three bytes
+  /// (six characters) leaves two bytes of slack, which is the difference between
+  /// "the tag survives" and "the tag is chopped in a way we cannot detect".
+  ///
+  /// This is only a rotation *hint* — see `advertisementData()` — so trading two
+  /// bytes of entropy for headroom costs nothing that matters.
+  static let advertisedNameBytes = 3
+
   /// Floor until negotiation completes. ATT_MTU 23 minus the 3-byte opcode +
   /// handle. Never assume more than this before the peer tells us otherwise.
   static let minUsableWrite = 20
+
+  /// How long a link may sit waiting for a "radio is ready again" callback
+  /// before we assume the callback is never coming. See `Link.blockedAt`.
+  static let blockedWatchdog: TimeInterval = 5
 }
 
 // MARK: - Errors
@@ -71,6 +102,14 @@ private enum BleErrorCode {
 
 private func bleException(_ code: String, _ message: String) -> Exception {
   return Exception(name: "BleMeshException", description: message, code: code)
+}
+
+/// What the radio hands back when an operation cannot be completed. The radio
+/// does not know about promises; the module turns this into a rejection *and* an
+/// `onError` event, so the two surfaces always carry the same code and message.
+private struct BleFailure {
+  let code: String
+  let message: String
 }
 
 // MARK: - Reassembly
@@ -208,9 +247,27 @@ private final class Link {
   var pending: [Data] = []
   var blocked = false
 
+  /// When `blocked` was last set. The whole pump depends on CoreBluetooth
+  /// calling `peripheralIsReady(toSendWriteWithoutResponse:)` or
+  /// `peripheralManagerIsReady(toUpdateSubscribers:)` back, and on some stacks
+  /// that callback simply does not arrive — at which point the link goes silent
+  /// forever with no error anywhere. Housekeeping watches this timestamp so the
+  /// worst case is a slow link rather than a dead one.
+  var blockedAt: Date?
+
   init(peerId: String, isIncoming: Bool) {
     self.peerId = peerId
     self.isIncoming = isIncoming
+  }
+
+  func markBlocked() {
+    blocked = true
+    if blockedAt == nil { blockedAt = Date() }
+  }
+
+  func markProgress() {
+    blocked = false
+    blockedAt = nil
   }
 }
 
@@ -220,15 +277,25 @@ private struct Discovered {
   var advertisedTag: String
 }
 
-// MARK: - Module
+// MARK: - Radio
 
-public final class BleMeshModule: Module {
+/// Everything that touches CoreBluetooth.
+///
+/// This is an `NSObject` because the three delegate protocols require it (see
+/// the file header). It knows nothing about Expo: events leave through
+/// `onEvent`, and operations report failure through a `BleFailure` completion
+/// rather than a `Promise`.
+private final class BleMeshRadio: NSObject {
   /// Every piece of mutable state below is touched only on this queue, including
   /// from both CoreBluetooth managers (which are constructed with it) and from
   /// every AsyncFunction. A serial queue rather than a lock because CoreBluetooth
   /// callbacks reenter and a recursive lock around this much state is how you get
   /// a deadlock you can only reproduce in a crowd.
   private let queue = DispatchQueue(label: "org.protestchat.blemesh", qos: .userInitiated)
+
+  /// Called on `queue` for every event. The owner is responsible for getting it
+  /// to the JS runtime on whatever thread that runtime demands.
+  var onEvent: ((String, [String: Any]) -> Void)?
 
   private var central: CBCentralManager?
   private var peripheralManager: CBPeripheralManager?
@@ -254,150 +321,123 @@ public final class BleMeshModule: Module {
 
   private var lastPublishedState: String?
 
-  // MARK: Definition
+  // MARK: Public surface (called from the module, off `queue`)
 
-  public func definition() -> ModuleDefinition {
-    Name("BleMesh")
-
-    Events(
-      "onPeerFound",
-      "onPeerLost",
-      "onConnected",
-      "onDisconnected",
-      "onPayload",
-      "onStateChange",
-      "onError"
-    )
-
-    OnDestroy {
-      self.queue.sync { self.teardown() }
+  func startAdvertising(rotationMs: Double, completion: @escaping (BleFailure?) -> Void) {
+    queue.async {
+      self.ensureManagers()
+      self.rotationInterval = rotationMs > 0 ? rotationMs / 1000 : Wire.defaultRotation
+      self.wantAdvertising = true
+      if self.localTag.isEmpty { self.localTag = Self.randomBytes(Wire.tagBytes) }
+      self.startRotationTimer()
+      self.startHousekeepingTimer()
+      self.applyPeripheralState()
+      completion(nil)
     }
+  }
 
-    AsyncFunction("startAdvertising") { (rotationMs: Double, promise: Promise) in
-      self.queue.async {
-        self.ensureManagers()
-        self.rotationInterval = rotationMs > 0 ? rotationMs / 1000 : Wire.defaultRotation
-        self.wantAdvertising = true
-        if self.localTag.isEmpty { self.localTag = Self.randomBytes(Wire.tagBytes) }
-        self.startRotationTimer()
-        self.startHousekeepingTimer()
-        self.applyPeripheralState()
-        promise.resolve(nil)
-      }
+  func startScanning(completion: @escaping (BleFailure?) -> Void) {
+    queue.async {
+      self.ensureManagers()
+      self.wantScanning = true
+      if self.localTag.isEmpty { self.localTag = Self.randomBytes(Wire.tagBytes) }
+      self.startHousekeepingTimer()
+      self.applyCentralState()
+      completion(nil)
     }
+  }
 
-    AsyncFunction("startScanning") { (promise: Promise) in
-      self.queue.async {
-        self.ensureManagers()
-        self.wantScanning = true
-        if self.localTag.isEmpty { self.localTag = Self.randomBytes(Wire.tagBytes) }
-        self.startHousekeepingTimer()
-        self.applyCentralState()
-        promise.resolve(nil)
-      }
+  func stopAll(completion: @escaping (BleFailure?) -> Void) {
+    queue.async {
+      self.teardown()
+      completion(nil)
     }
+  }
 
-    AsyncFunction("stopAll") { (promise: Promise) in
-      self.queue.async {
-        self.teardown()
-        promise.resolve(nil)
-      }
-    }
-
-    AsyncFunction("connect") { (peerId: String, promise: Promise) in
-      self.queue.async {
-        // Idempotent by contract: both devices will call this about each other
-        // at the same moment, and a second call must not produce a second link
-        // or an error the caller has to special-case.
-        if self.links[peerId] != nil {
-          promise.resolve(nil)
-          return
-        }
-        guard let entry = self.discovered[peerId] else {
-          self.failPromise(
-            promise,
-            code: BleErrorCode.unknownPeer,
-            message: "Unknown peer '\(peerId)'. It was never discovered, or it was already lost."
-          )
-          return
-        }
-        guard let central = self.central, central.state == .poweredOn else {
-          self.failPromise(
-            promise,
-            code: BleErrorCode.notStarted,
-            message: "Bluetooth central is not ready."
-          )
-          return
-        }
-        entry.peripheral.delegate = self
-        central.connect(entry.peripheral, options: nil)
-        promise.resolve(nil)
-      }
-    }
-
-    AsyncFunction("disconnect") { (peerId: String, promise: Promise) in
-      self.queue.async {
-        // Never fail on an absent peer — callers use this in cleanup paths.
-        self.dropLink(peerId, announce: true)
-        promise.resolve(nil)
-      }
-    }
-
-    AsyncFunction("send") { (peerId: String, payloadBase64: String, promise: Promise) in
-      guard let data = Data(base64Encoded: payloadBase64, options: [.ignoreUnknownCharacters]) else {
-        self.failPromise(
-          promise,
-          code: BleErrorCode.invalidPayload,
-          message: "payloadBase64 is not valid base64."
-        )
+  func connect(peerId: String, completion: @escaping (BleFailure?) -> Void) {
+    queue.async {
+      // Idempotent by contract: both devices will call this about each other
+      // at the same moment, and a second call must not produce a second link
+      // or an error the caller has to special-case.
+      if self.links[peerId] != nil {
+        completion(nil)
         return
       }
-      self.queue.async {
-        guard let link = self.links[peerId], link.announced else {
-          self.failPromise(
-            promise,
-            code: BleErrorCode.notConnected,
-            message: "Peer '\(peerId)' is not connected."
-          )
-          return
-        }
-        guard data.count <= Wire.maxMessageBytes else {
-          self.failPromise(
-            promise,
-            code: BleErrorCode.payloadTooLarge,
-            message: "Payload of \(data.count) bytes exceeds the \(Wire.maxMessageBytes) byte transport limit."
-          )
-          return
-        }
-        guard self.enqueue(link: link, type: Wire.typeData, payload: data) else {
-          self.failPromise(
-            promise,
-            code: BleErrorCode.sendFailed,
-            message: "Payload does not fit the framing header's chunk count."
-          )
-          return
-        }
-        self.pump(link)
-        promise.resolve(nil)
+      guard let entry = self.discovered[peerId] else {
+        completion(BleFailure(
+          code: BleErrorCode.unknownPeer,
+          message: "Unknown peer '\(peerId)'. It was never discovered, or it was already lost."
+        ))
+        return
       }
-    }
-
-    AsyncFunction("getStatus") { (promise: Promise) in
-      self.queue.async { promise.resolve(self.statusDictionary()) }
-    }
-
-    AsyncFunction("isAvailable") { (promise: Promise) in
-      self.queue.async {
-        promise.resolve(self.currentState() == "ready")
+      guard let central = self.central, central.state == .poweredOn else {
+        completion(BleFailure(
+          code: BleErrorCode.notStarted,
+          message: "Bluetooth central is not ready."
+        ))
+        return
       }
+      entry.peripheral.delegate = self
+      central.connect(entry.peripheral, options: nil)
+      completion(nil)
     }
+  }
 
-    AsyncFunction("rotateNow") { (promise: Promise) in
-      self.queue.async {
-        self.rotate()
-        promise.resolve(nil)
-      }
+  func disconnect(peerId: String, completion: @escaping (BleFailure?) -> Void) {
+    queue.async {
+      // Never fail on an absent peer — callers use this in cleanup paths.
+      self.dropLink(peerId, announce: true)
+      completion(nil)
     }
+  }
+
+  func send(peerId: String, payload: Data, completion: @escaping (BleFailure?) -> Void) {
+    queue.async {
+      guard let link = self.links[peerId], link.announced else {
+        completion(BleFailure(
+          code: BleErrorCode.notConnected,
+          message: "Peer '\(peerId)' is not connected."
+        ))
+        return
+      }
+      guard payload.count <= Wire.maxMessageBytes else {
+        completion(BleFailure(
+          code: BleErrorCode.payloadTooLarge,
+          message: "Payload of \(payload.count) bytes exceeds the \(Wire.maxMessageBytes) byte transport limit."
+        ))
+        return
+      }
+      guard self.enqueue(link: link, type: Wire.typeData, payload: payload) else {
+        completion(BleFailure(
+          code: BleErrorCode.sendFailed,
+          message: "Payload does not fit the framing header's chunk count."
+        ))
+        return
+      }
+      self.pump(link)
+      completion(nil)
+    }
+  }
+
+  func status(completion: @escaping ([String: Any]) -> Void) {
+    queue.async { completion(self.statusDictionary()) }
+  }
+
+  func isAvailable(completion: @escaping (Bool) -> Void) {
+    queue.async { completion(self.currentState() == "ready") }
+  }
+
+  func rotateNow(completion: @escaping (BleFailure?) -> Void) {
+    queue.async {
+      self.rotate()
+      completion(nil)
+    }
+  }
+
+  /// Synchronous because it runs from `OnDestroy`, after which the module — and
+  /// therefore the event sink — is gone.
+  func destroy() {
+    queue.sync { self.teardown() }
   }
 
   // MARK: - Manager lifecycle
@@ -473,7 +513,7 @@ public final class BleMeshModule: Module {
 
   /// What actually goes on the air.
   ///
-  /// Exactly two things: the service UUID, and a hex string of four CSPRNG bytes.
+  /// Exactly two things: the service UUID, and a hex string of three CSPRNG bytes.
   ///
   /// NOT the display name. NOT any part of the user's public key. NOT anything
   /// derived from either. The advertisement is readable by every radio in range
@@ -486,10 +526,19 @@ public final class BleMeshModule: Module {
   /// control (service *data* is silently dropped on iOS), which is why the tag
   /// rides in the local name here and in the scan-response service data on
   /// Android. Both sides read whichever their peer publishes.
+  ///
+  /// BYTE BUDGET. 31 bytes total: 3 for flags, 18 for the 128-bit service UUID,
+  /// 2 for the local name's AD header, leaving 8 for the name itself. Six hex
+  /// characters fits with two bytes of slack, so an OS-added field truncates the
+  /// slack instead of the tag. Even so the tag is treated as *advisory
+  /// everywhere it is read*: a truncated or entirely absent local name degrades
+  /// us to "cannot notice this peer rotated", never to "cannot see this peer" —
+  /// the service UUID is what the scan filter matches on, and the authoritative
+  /// full 8-byte tag arrives in-band in HELLO.
   private func advertisementData() -> [String: Any] {
     return [
       CBAdvertisementDataServiceUUIDsKey: [Wire.serviceUUID],
-      CBAdvertisementDataLocalNameKey: Self.hex(localTag.prefix(Wire.advertisedTagBytes)),
+      CBAdvertisementDataLocalNameKey: Self.hex(localTag.prefix(Wire.advertisedNameBytes)),
     ]
   }
 
@@ -538,7 +587,8 @@ public final class BleMeshModule: Module {
     housekeepingTimer = timer
   }
 
-  /// Ages out stale discoveries, un-HELLO'd links and abandoned reassemblies.
+  /// Ages out stale discoveries, un-HELLO'd links and abandoned reassemblies,
+  /// and un-sticks any link whose flow-control callback never arrived.
   private func housekeeping() {
     let now = Date()
 
@@ -557,8 +607,32 @@ public final class BleMeshModule: Module {
         dropLink(peerId, announce: false)
       } else {
         link.reassembler.sweep()
+        checkPumpWatchdog(link, now: now)
       }
     }
+  }
+
+  /// The pump is entirely callback-driven, so a callback that never arrives is
+  /// indistinguishable from a link with nothing to say — except that it never
+  /// recovers. Whether any shipping stack actually drops
+  /// `peripheralIsReady(toSendWriteWithoutResponse:)` or
+  /// `peripheralManagerIsReady(toUpdateSubscribers:)` cannot be established
+  /// without two phones and a lot of traffic; this makes the failure survivable
+  /// either way. Clearing `blocked` and retrying costs at most one wasted
+  /// `updateValue`, which the stack will simply refuse again.
+  private func checkPumpWatchdog(_ link: Link, now: Date) {
+    guard link.blocked, !link.pending.isEmpty, let since = link.blockedAt else { return }
+    guard now.timeIntervalSince(since) > Wire.blockedWatchdog else { return }
+
+    // Visible, not silent: a mesh that has quietly stopped forwarding is the
+    // worst possible failure mode at a protest.
+    emitError(
+      code: BleErrorCode.sendFailed,
+      message: "Link '\(link.peerId)' saw no flow-control callback for "
+        + "\(Int(Wire.blockedWatchdog))s; retrying \(link.pending.count) queued chunk(s)."
+    )
+    link.markProgress()
+    pump(link)
   }
 
   // MARK: - Framing
@@ -612,12 +686,13 @@ public final class BleMeshModule: Module {
               let central = link.central
         else {
           link.pending.removeAll()
+          link.markProgress()
           return
         }
         if !manager.updateValue(frame, for: outbound, onSubscribedCentrals: [central]) {
           // Transmit queue full. peripheralManagerIsReadyToUpdateSubscribers
-          // will call us back.
-          link.blocked = true
+          // will call us back — and if it does not, the watchdog will.
+          link.markBlocked()
           return
         }
       } else {
@@ -625,11 +700,12 @@ public final class BleMeshModule: Module {
               let inbound = link.inboundCharacteristic
         else {
           link.pending.removeAll()
+          link.markProgress()
           return
         }
         if inbound.properties.contains(.writeWithoutResponse) {
           if !peripheral.canSendWriteWithoutResponse {
-            link.blocked = true
+            link.markBlocked()
             return
           }
           peripheral.writeValue(frame, for: inbound, type: .withoutResponse)
@@ -642,13 +718,13 @@ public final class BleMeshModule: Module {
       }
 
       link.pending.removeFirst()
-      link.blocked = false
+      link.markProgress()
     }
   }
 
   private func pumpAll() {
     for link in links.values where link.blocked || !link.pending.isEmpty {
-      link.blocked = false
+      link.markProgress()
       pump(link)
     }
   }
@@ -698,6 +774,11 @@ public final class BleMeshModule: Module {
   }
 
   /// A link becomes addressable only once the peer has told us its ephemeral tag.
+  ///
+  /// This is the *only* identity that matters. The advertised tag is a hint that
+  /// may be truncated, absent, or unreadable on one platform or the other; HELLO
+  /// is in-band, full width, and symmetric, so a link that connects with no
+  /// advertised tag at all still resolves normally here.
   private func handleHello(link: Link, tag: Data) {
     guard tag.count == Wire.tagBytes else {
       dropLink(link.peerId, announce: false)
@@ -877,34 +958,24 @@ public final class BleMeshModule: Module {
 
   // MARK: - Emitting
 
-  /// All events reach JS on the main queue; CoreBluetooth callbacks arrive on
-  /// `queue` and must not touch the JS runtime directly.
   private func emit(_ name: String, _ body: [String: Any]) {
-    DispatchQueue.main.async { [weak self] in
-      self?.sendEvent(name, body)
-    }
+    onEvent?(name, body)
   }
 
   private func emitError(code: String, message: String) {
     emit("onError", ["message": message, "code": code])
   }
-
-  /// Every failure both rejects the promise and surfaces on `onError`.
-  private func failPromise(_ promise: Promise, code: String, message: String) {
-    emitError(code: code, message: message)
-    promise.reject(bleException(code, message))
-  }
 }
 
 // MARK: - CBCentralManagerDelegate (scanning + outbound links)
 
-extension BleMeshModule: CBCentralManagerDelegate {
-  public func centralManagerDidUpdateState(_ manager: CBCentralManager) {
+extension BleMeshRadio: CBCentralManagerDelegate {
+  func centralManagerDidUpdateState(_ manager: CBCentralManager) {
     publishStateIfChanged()
     applyCentralState()
   }
 
-  public func centralManager(
+  func centralManager(
     _ manager: CBCentralManager,
     didDiscover peripheral: CBPeripheral,
     advertisementData: [String: Any],
@@ -914,13 +985,25 @@ extension BleMeshModule: CBCentralManagerDelegate {
 
     // Android peers publish the tag as service data; iOS peers publish it as the
     // local name, because that is the only advertisement field CoreBluetooth
-    // exposes to an app. Read whichever is present. Neither is trusted for
-    // anything beyond noticing a rotation — the in-band HELLO is authoritative.
+    // exposes to an app. Read whichever is present.
+    //
+    // UNVERIFIED ON HARDWARE: that an iPhone reliably sees an Android peer's
+    // scan-response service data, and that an Android phone reliably sees this
+    // iPhone's local name, are both plausible-but-untested. The code is written
+    // so that neither mattering is survivable: an empty tag here is not an
+    // error, does not suppress the discovery, and does not stop `connect()`.
+    // The consequence of a missing tag is exactly one thing — we cannot notice
+    // that this peer rotated — and HELLO re-establishes identity on every link
+    // regardless.
     var tag = ""
     if let serviceData = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data],
-       let bytes = serviceData[Wire.serviceUUID] {
+       let bytes = serviceData[Wire.serviceUUID], !bytes.isEmpty {
       tag = Self.hex(bytes.prefix(Wire.advertisedTagBytes))
-    } else if let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String {
+    } else if let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String,
+              !name.isEmpty {
+      // Taken verbatim, however short. A local name truncated by the OS is still
+      // stable for as long as the peer does not rotate, so it remains a usable
+      // rotation hint; it is never parsed, compared across peers, or trusted.
       tag = name
     }
 
@@ -936,16 +1019,17 @@ extension BleMeshModule: CBCentralManagerDelegate {
     }
   }
 
-  public func centralManager(_ manager: CBCentralManager, didConnect peripheral: CBPeripheral) {
+  func centralManager(_ manager: CBCentralManager, didConnect peripheral: CBPeripheral) {
     let id = peerId(for: peripheral)
     if links[id] == nil {
       links[id] = Link(peerId: id, isIncoming: false)
     }
+    links[id]?.peripheral = peripheral
     peripheral.delegate = self
     peripheral.discoverServices([Wire.serviceUUID])
   }
 
-  public func centralManager(
+  func centralManager(
     _ manager: CBCentralManager,
     didFailToConnect peripheral: CBPeripheral,
     error: Error?
@@ -958,7 +1042,7 @@ extension BleMeshModule: CBCentralManagerDelegate {
     )
   }
 
-  public func centralManager(
+  func centralManager(
     _ manager: CBCentralManager,
     didDisconnectPeripheral peripheral: CBPeripheral,
     error: Error?
@@ -970,8 +1054,8 @@ extension BleMeshModule: CBCentralManagerDelegate {
 
 // MARK: - CBPeripheralDelegate (central role: talking to a peer's server)
 
-extension BleMeshModule: CBPeripheralDelegate {
-  public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+extension BleMeshRadio: CBPeripheralDelegate {
+  func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
     guard error == nil, let service = peripheral.services?.first(where: { $0.uuid == Wire.serviceUUID })
     else {
       central?.cancelPeripheralConnection(peripheral)
@@ -980,7 +1064,7 @@ extension BleMeshModule: CBPeripheralDelegate {
     peripheral.discoverCharacteristics([Wire.inboundUUID, Wire.outboundUUID], for: service)
   }
 
-  public func peripheral(
+  func peripheral(
     _ peripheral: CBPeripheral,
     didDiscoverCharacteristicsFor service: CBService,
     error: Error?
@@ -1015,7 +1099,7 @@ extension BleMeshModule: CBPeripheralDelegate {
     sendHello(link)
   }
 
-  public func peripheral(
+  func peripheral(
     _ peripheral: CBPeripheral,
     didUpdateValueFor characteristic: CBCharacteristic,
     error: Error?
@@ -1028,7 +1112,7 @@ extension BleMeshModule: CBPeripheralDelegate {
     receive(link: link, frame: data)
   }
 
-  public func peripheral(
+  func peripheral(
     _ peripheral: CBPeripheral,
     didWriteValueFor characteristic: CBCharacteristic,
     error: Error?
@@ -1040,25 +1124,26 @@ extension BleMeshModule: CBPeripheralDelegate {
         message: "Write to '\(link.peerId)' failed: \(error.localizedDescription)"
       )
     }
+    link.markProgress()
     pump(link)
   }
 
-  public func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+  func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
     guard let link = link(for: peripheral) else { return }
-    link.blocked = false
+    link.markProgress()
     pump(link)
   }
 }
 
 // MARK: - CBPeripheralManagerDelegate (peripheral role: serving inbound centrals)
 
-extension BleMeshModule: CBPeripheralManagerDelegate {
-  public func peripheralManagerDidUpdateState(_ manager: CBPeripheralManager) {
+extension BleMeshRadio: CBPeripheralManagerDelegate {
+  func peripheralManagerDidUpdateState(_ manager: CBPeripheralManager) {
     publishStateIfChanged()
     applyPeripheralState()
   }
 
-  public func peripheralManagerDidStartAdvertising(
+  func peripheralManagerDidStartAdvertising(
     _ manager: CBPeripheralManager,
     error: Error?
   ) {
@@ -1070,7 +1155,7 @@ extension BleMeshModule: CBPeripheralManagerDelegate {
     }
   }
 
-  public func peripheralManager(
+  func peripheralManager(
     _ manager: CBPeripheralManager,
     central: CBCentral,
     didSubscribeTo characteristic: CBCharacteristic
@@ -1086,7 +1171,7 @@ extension BleMeshModule: CBPeripheralManagerDelegate {
     sendHello(link)
   }
 
-  public func peripheralManager(
+  func peripheralManager(
     _ manager: CBPeripheralManager,
     central: CBCentral,
     didUnsubscribeFrom characteristic: CBCharacteristic
@@ -1095,34 +1180,156 @@ extension BleMeshModule: CBPeripheralManagerDelegate {
     dropLink(central.identifier.uuidString, announce: true)
   }
 
-  public func peripheralManager(
+  /// The documented CoreBluetooth contract for this callback, verified against
+  /// the current `CBPeripheralManagerDelegate` header:
+  ///
+  ///  - `requests` contains one or more `CBATTRequest`s, all from the same
+  ///    central, and they are an atomic unit.
+  ///  - You must call `respond(to:withResult:)` **exactly once**, passing the
+  ///    **first** request in the array, even though the array may hold several.
+  ///    Responding to the others is an API misuse; responding to none stalls
+  ///    that central's ATT queue until it times out.
+  ///  - The result you pass applies to the whole batch, so if any request in the
+  ///    batch is unacceptable the correct answer is a single error response —
+  ///    not a partial success.
+  ///
+  /// This is *not* an assumption about who sent the write. Even a peer that used
+  /// write-without-response is answered here; the response is consumed by the
+  /// local stack rather than put on the air, so answering costs nothing and not
+  /// answering is what hangs.
+  func peripheralManager(
     _ manager: CBPeripheralManager,
     didReceiveWrite requests: [CBATTRequest]
   ) {
+    guard let first = requests.first else { return }
+
+    // Validate the whole batch before applying any of it, so the single response
+    // we are allowed to send is honest about what happened.
+    var result: CBATTError.Code = .success
     for request in requests {
-      guard request.characteristic.uuid == Wire.inboundUUID, let value = request.value else {
-        continue
+      if request.characteristic.uuid != Wire.inboundUUID {
+        result = .writeNotPermitted
+      } else if request.offset != 0 {
+        // Long writes are not part of the contract: our own framing already keeps
+        // every write inside one MTU, so a non-zero offset can only come from a
+        // peer doing something we did not ask for.
+        result = .invalidOffset
       }
-      let id = request.central.identifier.uuidString
-      let link = links[id] ?? {
-        // A peer may write before it subscribes. Create the link so the frame is
-        // not lost; `didSubscribeTo` will fill in the CBCentral.
-        let created = Link(peerId: id, isIncoming: true)
-        created.central = request.central
-        created.usableWrite = max(Wire.minUsableWrite, request.central.maximumUpdateValueLength)
-        links[id] = created
-        return created
-      }()
-      receive(link: link, frame: value)
     }
-    // CoreBluetooth requires a response to the *first* request only, and requires
-    // it even for writes the peer sent without response.
-    if let first = requests.first {
-      manager.respond(to: first, withResult: .success)
+
+    if result == .success {
+      for request in requests {
+        guard let value = request.value else { continue }
+        let id = request.central.identifier.uuidString
+        let link = links[id] ?? {
+          // A peer may write before it subscribes. Create the link so the frame is
+          // not lost; `didSubscribeTo` will fill in the CBCentral.
+          let created = Link(peerId: id, isIncoming: true)
+          created.central = request.central
+          created.usableWrite = max(Wire.minUsableWrite, request.central.maximumUpdateValueLength)
+          links[id] = created
+          return created
+        }()
+        receive(link: link, frame: value)
+      }
+    }
+
+    manager.respond(to: first, withResult: result)
+  }
+
+  func peripheralManagerIsReady(toUpdateSubscribers manager: CBPeripheralManager) {
+    pumpAll()
+  }
+}
+
+// MARK: - Module
+
+/// The Expo surface. Holds one radio, forwards every AsyncFunction to it, and is
+/// the only thing in this file that knows what a `Promise` or an event emitter
+/// is. See the file header for why the CoreBluetooth work cannot live here.
+public final class BleMeshModule: Module {
+  private let radio = BleMeshRadio()
+
+  public func definition() -> ModuleDefinition {
+    Name("BleMesh")
+
+    Events(
+      "onPeerFound",
+      "onPeerLost",
+      "onConnected",
+      "onDisconnected",
+      "onPayload",
+      "onStateChange",
+      "onError"
+    )
+
+    OnCreate {
+      // All events reach JS on the main queue; CoreBluetooth callbacks arrive on
+      // the radio's own serial queue and must not touch the JS runtime directly.
+      self.radio.onEvent = { [weak self] name, body in
+        DispatchQueue.main.async { self?.sendEvent(name, body) }
+      }
+    }
+
+    OnDestroy {
+      self.radio.onEvent = nil
+      self.radio.destroy()
+    }
+
+    AsyncFunction("startAdvertising") { (rotationMs: Double, promise: Promise) in
+      self.radio.startAdvertising(rotationMs: rotationMs) { self.settle(promise, $0) }
+    }
+
+    AsyncFunction("startScanning") { (promise: Promise) in
+      self.radio.startScanning { self.settle(promise, $0) }
+    }
+
+    AsyncFunction("stopAll") { (promise: Promise) in
+      self.radio.stopAll { self.settle(promise, $0) }
+    }
+
+    AsyncFunction("connect") { (peerId: String, promise: Promise) in
+      self.radio.connect(peerId: peerId) { self.settle(promise, $0) }
+    }
+
+    AsyncFunction("disconnect") { (peerId: String, promise: Promise) in
+      self.radio.disconnect(peerId: peerId) { self.settle(promise, $0) }
+    }
+
+    AsyncFunction("send") { (peerId: String, payloadBase64: String, promise: Promise) in
+      guard let data = Data(base64Encoded: payloadBase64, options: [.ignoreUnknownCharacters]) else {
+        self.settle(promise, BleFailure(
+          code: BleErrorCode.invalidPayload,
+          message: "payloadBase64 is not valid base64."
+        ))
+        return
+      }
+      self.radio.send(peerId: peerId, payload: data) { self.settle(promise, $0) }
+    }
+
+    AsyncFunction("getStatus") { (promise: Promise) in
+      self.radio.status { promise.resolve($0) }
+    }
+
+    AsyncFunction("isAvailable") { (promise: Promise) in
+      self.radio.isAvailable { promise.resolve($0) }
+    }
+
+    AsyncFunction("rotateNow") { (promise: Promise) in
+      self.radio.rotateNow { self.settle(promise, $0) }
     }
   }
 
-  public func peripheralManagerIsReady(toUpdateSubscribers manager: CBPeripheralManager) {
-    pumpAll()
+  /// Every failure both rejects the promise and surfaces on `onError`, so a
+  /// global error surface can observe failures without wrapping every call.
+  private func settle(_ promise: Promise, _ failure: BleFailure?) {
+    guard let failure else {
+      promise.resolve(nil)
+      return
+    }
+    DispatchQueue.main.async {
+      self.sendEvent("onError", ["message": failure.message, "code": failure.code])
+    }
+    promise.reject(bleException(failure.code, failure.message))
   }
 }

@@ -48,12 +48,28 @@ That is handled, not prevented — see *duplicate links* below.
 
 Android requests **MTU 512** on connect, before service discovery — requesting it
 afterwards leaves cached characteristics on some stacks and you frame at 20 bytes
-forever. iOS has no `requestMtu`; it negotiates for you and the result is read
+forever. Discovery is **not gated on `onMtuChanged`**, though: it starts on a
+600 ms timer whether or not that callback ever arrives, because a bigger MTU is
+an optimisation and the 23-byte default is slow rather than broken, while a link
+that never discovers is dead. Both callers are idempotent. iOS has no
+`requestMtu`; it negotiates for you and the result is read
 from `maximumWriteValueLength(for: .withoutResponse)` (central role) or
 `CBCentral.maximumUpdateValueLength` (peripheral role).
 
 **Until negotiation completes, 20 bytes is all we assume** (`MIN_USABLE_WRITE`) —
 ATT_MTU 23 minus the 3-byte opcode and handle.
+
+### Why iOS has two classes
+
+`BleMeshRadio: NSObject` owns both CoreBluetooth managers, the link table and all
+three delegate conformances; `BleMeshModule: Module` holds one radio, forwards
+the `AsyncFunction`s and turns the radio's `onEvent` callback into `sendEvent`.
+
+This is not taste. Expo's `Module` is a plain Swift class, not `NSObject`, and
+its `required init(appContext:)` is unavailable for override — while every
+CoreBluetooth delegate protocol inherits `NSObjectProtocol`, which Swift refuses
+to let a non-`NSObject` class adopt. The split is the only way the module
+compiles, and the payoff is that the radio never imports Expo at all.
 
 ## Chunking lives in the native layer
 
@@ -147,13 +163,26 @@ Where the tag rides differs by platform because the platforms differ:
 | iOS | `CBAdvertisementDataLocalNameKey` — the only advertisement field CoreBluetooth lets an app set; service *data* is silently dropped | local name **and** service data |
 | Android | scan-response **service data** — `setIncludeDeviceName(false)` is load-bearing, the device name is "Someone's Pixel" and is permanent | service data **and** `ScanRecord.getDeviceName()` |
 
-Only 4 of the tag's 8 bytes are advertised: a BLE advertisement is 31 bytes and a
-128-bit service UUID already spends 18 of them, so the full tag would overflow and
-be truncated by the OS — a worse failure than deliberately publishing less. The
-advertised tag is a **hint** used only to notice a rotation and to skip
+Only part of the tag's 8 bytes is advertised — **3 bytes on iOS, 4 on Android** —
+because a BLE advertisement is 31 bytes and a 128-bit service UUID already spends
+18 of them, so the full tag would overflow and be truncated by the OS, a worse
+failure than deliberately publishing less. Android can afford the extra byte
+because its tag rides in the scan response, a second 31-byte packet of its own;
+iOS has no second packet, so after flags (3), the service UUID (18) and the local
+name's AD header (2) there are 8 bytes left and six hex characters deliberately
+leaves slack for any field the OS adds on its own.
+
+The advertised tag is a **hint** used only to notice a rotation and to skip
 re-connecting to something we already hold. The full 8-byte tag travels in-band in
 the `HELLO` frame, which is the first frame sent in both directions on every link,
-and that is what deduplication actually keys on.
+and that is what deduplication actually keys on. A truncated advertised tag, or
+none at all, therefore degrades to *"we cannot tell that this peer rotated"* and
+never to *"we cannot connect"*: the scan filter matches the service UUID, which
+is in the advertisement proper, and identity is settled by `HELLO` regardless.
+
+Note that the two read paths are asymmetric — iOS reads Android's service data,
+Android reads iOS's local name — and **neither has been confirmed on two physical
+phones**. Both are written so that yielding nothing is survivable.
 
 ### What this does *not* fix
 
@@ -187,6 +216,33 @@ On the other phone that same wire is the inbound one, so both keep it.
 A link that has not sent `HELLO` within 10 s is dropped. Android will only give
 you a handful of concurrent GATT connections — typically around seven, after which
 every `connectGatt` silently fails — so an unusable link is worse than none.
+
+## Failure modes that are handled rather than prevented
+
+Three of these are "the code assumed a callback always fires". None of them can
+be fully verified without two phones, so each is made to **degrade** instead of
+hang, and each is loud on `onError` when it trips.
+
+| Assumption | If it does not hold | What happens instead |
+| --- | --- | --- |
+| The write/notify completion callback always fires | The link latches mute forever, silently — the queue simply stops draining | A watchdog (4 s Android, 5 s iOS, checked by the 5 s housekeeping tick) clears the busy/blocked flag, emits `ERR_BLE_SEND_FAILED` and re-pumps. Worst case is a slow link and at most one duplicate frame, which the far side's reassembler already discards by index. |
+| `onMtuChanged` always fires | The link connects, never discovers, and is useless | Discovery runs off a 600 ms timer regardless; the MTU stays at the 20-byte floor. |
+| The stack will accept a write eventually | The 25 ms retry loop spins forever holding a GATT slot | Bounded at 20 retries (~0.5 s), after which the queue is dropped with an error and the mesh delivers by another route. |
+
+Android additionally throttles dialling, because both phones dial on every
+sighting and Android's GATT client budget is roughly seven links before every
+`connectGatt` starts failing with status 133:
+
+- at most **4 outbound links** at once,
+- **exponential backoff** per peer after a failed dial (2 s doubling to 60 s,
+  reset the moment a link reaches `HELLO`),
+- a peer already connected *or still connecting* is never dialled again — the
+  link enters the table when `connectGatt` is issued, not when it succeeds,
+- `close()` on **every** terminal path, including a `BluetoothGatt` whose link
+  was already dropped while the connect was in flight.
+
+Events on Android are posted to the main looper and a delivery failure is logged
+*and* reported on `onError`; a dropped event is a peer the UI never hears about.
 
 ## API
 

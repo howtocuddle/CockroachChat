@@ -45,9 +45,11 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.os.ParcelUuid
 import android.os.SystemClock
 import android.util.Base64
+import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.core.os.bundleOf
 import expo.modules.interfaces.permissions.PermissionsResponse
@@ -98,6 +100,40 @@ private const val MIN_USABLE_WRITE = 20
 
 /** What we ask for. Android caps at 517; 512 is the largest useful ATT payload. */
 private const val REQUESTED_MTU = 512
+
+private const val LOG_TAG = "BleMesh"
+
+/**
+ * How long a link may sit with an outstanding GATT operation before we assume the
+ * completion callback is never coming. See [BleMeshModule.checkPumpWatchdog].
+ */
+private const val WRITE_WATCHDOG_MS = 4_000L
+
+/**
+ * How long we let `requestMtu` try before discovering services anyway. A larger
+ * MTU is an optimisation; the 23-byte default is slow, not broken, and a stack
+ * that never delivers `onMtuChanged` must not cost us the whole link.
+ */
+private const val MTU_GRACE_MS = 600L
+
+/**
+ * Cap on outbound (GATT client) links. Android hands out roughly seven before
+ * every `connectGatt` starts failing with status 133, and the inbound direction
+ * consumes from the same budget on some stacks, so we stay comfortably under it.
+ * A mesh is fed by relaying, not by holding every peer at once.
+ */
+private const val MAX_OUTBOUND_LINKS = 4
+
+/** Exponential backoff after a failed dial, per peer. */
+private const val BACKOFF_BASE_MS = 2_000L
+private const val BACKOFF_MAX_MS = 60_000L
+
+/**
+ * Give up re-issuing a chunk the stack keeps refusing. 20 x 25 ms is half a
+ * second of "not now", which is far longer than real congestion lasts and is the
+ * point at which the refusal is structural rather than transient.
+ */
+private const val MAX_ISSUE_RETRIES = 20
 
 /**
  * Coded error identifiers. Duplicated verbatim in the iOS implementation.
@@ -248,6 +284,24 @@ private class Link(
    */
   val pending = ArrayDeque<ByteArray>()
   var busy = false
+
+  /**
+   * When [busy] was last set. The whole pump depends on `onCharacteristicWrite` /
+   * `onNotificationSent` coming back, and on some stacks one of them simply does
+   * not arrive - at which point the link latches mute forever with no error
+   * anywhere. Housekeeping watches this timestamp so the worst case is a slow
+   * link rather than a dead one.
+   */
+  var busySince: Long = 0
+
+  /** How many consecutive times the stack has refused to accept the head frame. */
+  var issueRetries = 0
+
+  /**
+   * Service discovery is kicked off by whichever of `onMtuChanged` and the MTU
+   * grace timer gets there first, so it has to be idempotent.
+   */
+  var discoveryStarted = false
 }
 
 private class Discovered(
@@ -272,6 +326,12 @@ class BleMeshModule : Module() {
   private val thread = HandlerThread("org.protestchat.blemesh").apply { start() }
   private val handler = Handler(thread.looper)
 
+  /**
+   * Events must reach the JS runtime from the main looper; BLE callbacks arrive
+   * on [thread] and must not touch it directly.
+   */
+  private val mainHandler = Handler(Looper.getMainLooper())
+
   private var adapter: BluetoothAdapter? = null
   private var gattServer: BluetoothGattServer? = null
   private var outboundCharacteristic: BluetoothGattCharacteristic? = null
@@ -291,6 +351,16 @@ class BleMeshModule : Module() {
    *  of a duplicate link get distinct handles and can be told apart. */
   private val peerIds = HashMap<String, String>()
   private val discovered = HashMap<String, Discovered>()
+
+  /**
+   * Consecutive failed dials per peer, and the moment we are next allowed to try
+   * again. Both phones dial on every sighting, and a peer whose stack is wedged
+   * (status 133 is the classic) will refuse every attempt - retrying it at scan
+   * rate is how an Android BLE app burns its GATT client slots and its battery
+   * at the same time.
+   */
+  private val connectFailures = HashMap<String, Int>()
+  private val backoffUntil = HashMap<String, Long>()
 
   private var lastPublishedState: String? = null
   private var housekeepingScheduled = false
@@ -363,7 +433,9 @@ class BleMeshModule : Module() {
       handler.post {
         // Idempotent by contract: both devices will call this about each other at
         // the same moment, and a second call must not produce a second link or an
-        // error the caller has to special-case.
+        // error the caller has to special-case. This is also what refuses to dial
+        // a peer that is already connected *or still connecting* - the link is in
+        // the table from the instant connectGatt is issued, not from onConnected.
         if (links.containsKey(peerId)) {
           promise.resolve(null)
           return@post
@@ -383,18 +455,60 @@ class BleMeshModule : Module() {
           return@post
         }
 
+        val now = SystemClock.elapsedRealtime()
+        val until = backoffUntil[peerId] ?: 0L
+        if (now < until) {
+          failPromise(
+            promise,
+            BleErrorCode.CONNECT_FAILED,
+            "Backing off from '$peerId' for another ${(until - now) / 1000}s after " +
+              "${connectFailures[peerId] ?: 0} failed connect attempt(s)."
+          )
+          return@post
+        }
+
+        // A slot refused now is a slot available for the next peer that appears.
+        // Exceeding the stack's limit is not refused, it is *silently* failed with
+        // status 133 - and then every later connect fails too.
+        val outbound = links.values.count { !it.isIncoming }
+        if (outbound >= MAX_OUTBOUND_LINKS) {
+          failPromise(
+            promise,
+            BleErrorCode.CONNECT_FAILED,
+            "Already holding $outbound outbound links, which is this transport's cap."
+          )
+          return@post
+        }
+
         val link = Link(peerId, isIncoming = false, device = entry.device)
         links[peerId] = link
-        link.gatt = entry.device.connectGatt(
-          context,
-          // autoConnect=false: the direct path. autoConnect=true queues the
-          // connection in the stack's background scanner, which can sit unfired
-          // for minutes - useless when both phones are only in range while their
-          // owners walk past each other.
-          false,
-          gattClientCallback,
-          BluetoothDevice.TRANSPORT_LE
-        )
+        val gatt = runCatching {
+          entry.device.connectGatt(
+            context,
+            // autoConnect=false: the direct path. autoConnect=true queues the
+            // connection in the stack's background scanner, which can sit unfired
+            // for minutes - useless when both phones are only in range while their
+            // owners walk past each other.
+            false,
+            gattClientCallback,
+            BluetoothDevice.TRANSPORT_LE
+          )
+        }.getOrNull()
+
+        if (gatt == null) {
+          // No BluetoothGatt means no callbacks will ever arrive for this peer, so
+          // nothing else would ever clean the placeholder link up.
+          links.remove(peerId)
+          noteConnectFailure(peerId)
+          failPromise(
+            promise,
+            BleErrorCode.CONNECT_FAILED,
+            "The Bluetooth stack refused to open a GATT client for '$peerId'."
+          )
+          return@post
+        }
+
+        link.gatt = gatt
         promise.resolve(null)
       }
     }
@@ -555,6 +669,11 @@ class BleMeshModule : Module() {
     //
     // The tag goes in the scan response rather than the advertisement because a
     // 128-bit service UUID already spends 18 of the advertisement's 31 bytes.
+    // That split is also what keeps Android's byte budget comfortable where
+    // iOS's is not: the scan response is a second 31-byte packet all to itself,
+    // so four bytes of service data here can never crowd out the service UUID a
+    // scanner filters on. iOS has no such second packet - see the byte-budget
+    // note in advertisementData() over there.
     val advertiseData = AdvertiseData.Builder()
       .setIncludeDeviceName(false)
       .setIncludeTxPowerLevel(false)
@@ -694,8 +813,48 @@ class BleMeshModule : Module() {
         dropLink(peerId, announce = false)
       } else {
         link.reassembler.sweep()
+        checkPumpWatchdog(link, now)
       }
     }
+  }
+
+  /**
+   * Un-sticks a link whose GATT completion callback never arrived.
+   *
+   * The pump is entirely callback-driven: `busy` is set when a frame is handed to
+   * the stack and cleared only by `onCharacteristicWrite` / `onNotificationSent`.
+   * A stack that drops one of those leaves the link permanently mute and, worse,
+   * completely silent about it - the queue just stops draining. Clearing `busy`
+   * and re-pumping costs at most one duplicate frame, which the far side's
+   * reassembler already ignores by index.
+   *
+   * UNVERIFIABLE WITHOUT HARDWARE: whether any shipping stack actually drops
+   * these callbacks cannot be established from here. This makes it survivable
+   * either way - a slow link instead of a dead one - and makes it loud.
+   */
+  private fun checkPumpWatchdog(link: Link, now: Long) {
+    if (!link.busy || now - link.busySince <= WRITE_WATCHDOG_MS) return
+    emitError(
+      BleErrorCode.SEND_FAILED,
+      "Link '${link.peerId}' saw no GATT completion callback for " +
+        "${WRITE_WATCHDOG_MS / 1000}s; continuing with ${link.pending.size} queued chunk(s)."
+    )
+    link.busy = false
+    link.issueRetries = 0
+    pump(link)
+  }
+
+  /** Exponential, capped, and reset the moment a link actually works. */
+  private fun noteConnectFailure(peerId: String) {
+    val failures = (connectFailures[peerId] ?: 0) + 1
+    connectFailures[peerId] = failures
+    val delay = minOf(BACKOFF_MAX_MS, BACKOFF_BASE_MS shl minOf(failures - 1, 16))
+    backoffUntil[peerId] = SystemClock.elapsedRealtime() + delay
+  }
+
+  private fun clearConnectFailures(peerId: String) {
+    connectFailures.remove(peerId)
+    backoffUntil.remove(peerId)
   }
 
   // -------------------------------------------------------------------------
@@ -748,9 +907,25 @@ class BleMeshModule : Module() {
     if (issued) {
       link.pending.removeFirst()
       link.busy = true
+      link.busySince = SystemClock.elapsedRealtime()
+      link.issueRetries = 0
+    } else if (link.issueRetries >= MAX_ISSUE_RETRIES) {
+      // Half a second of uninterrupted refusal is not congestion, it is a link
+      // that cannot carry anything. Spinning on it forever would keep a GATT slot
+      // and a wakelock alive for a peer that will never hear us, so drop the
+      // queue loudly and let the epidemic mesh deliver by another route.
+      link.issueRetries = 0
+      val dropped = link.pending.size
+      link.pending.clear()
+      emitError(
+        BleErrorCode.SEND_FAILED,
+        "The stack refused $dropped chunk(s) for '${link.peerId}' for " +
+          "${MAX_ISSUE_RETRIES * 25}ms; giving up on them."
+      )
     } else {
       // Transient stack congestion. Retry rather than drop; the completion
       // callbacks are what normally drive this loop.
+      link.issueRetries += 1
       handler.postDelayed({ if (links[link.peerId] === link) pump(link) }, 25)
     }
   }
@@ -838,7 +1013,14 @@ class BleMeshModule : Module() {
     pump(link)
   }
 
-  /** A link becomes addressable only once the peer has told us its ephemeral tag. */
+  /**
+   * A link becomes addressable only once the peer has told us its ephemeral tag.
+   *
+   * This is the *only* identity that matters. The advertised tag is a hint that
+   * may be truncated, absent, or unreadable on one platform or the other; HELLO
+   * is in-band, full width, and symmetric, so a link that connected with no
+   * advertised tag at all still resolves normally here.
+   */
   private fun handleHello(link: Link, tag: ByteArray) {
     if (tag.size != TAG_BYTES) {
       dropLink(link.peerId, announce = false)
@@ -853,6 +1035,9 @@ class BleMeshModule : Module() {
 
     if (link.announced) return
     link.announced = true
+    // A link that reached HELLO is proof the peer is dialable, so the backoff
+    // ladder for it starts from scratch next time.
+    clearConnectFailures(link.peerId)
     emit(
       "onConnected",
       bundleOf(
@@ -934,6 +1119,8 @@ class BleMeshModule : Module() {
     links.clear()
     discovered.clear()
     peerIds.clear()
+    connectFailures.clear()
+    backoffUntil.clear()
 
     runCatching { gattServer?.close() }
     gattServer = null
@@ -990,10 +1177,22 @@ class BleMeshModule : Module() {
     // the only field CoreBluetooth exposes to an app; Android peers publish it as
     // scan-response service data. Read whichever is present. Neither is trusted
     // for anything beyond noticing a rotation - the in-band HELLO is authoritative.
+    //
+    // UNVERIFIED ON HARDWARE: the two read paths are asymmetric (we read iOS's
+    // local name, iOS reads our service data) and neither has been confirmed on
+    // two physical phones. Everything below is written so that neither working is
+    // survivable: an empty tag is not an error, does not suppress the discovery,
+    // and does not stop connect(). The single consequence of a missing or
+    // truncated tag is that we cannot notice this peer rotated - never that we
+    // cannot reach it. The scan filter matches on the service UUID, which is in
+    // the advertisement proper and cannot be crowded out by the tag.
     val record = result.scanRecord
     val serviceData = record?.getServiceData(ParcelUuid(SERVICE_UUID))
     val tag = when {
       serviceData != null && serviceData.isNotEmpty() -> hex(serviceData)
+      // Taken verbatim, however short: a name the OS truncated is still stable
+      // until the peer rotates, so it remains usable as a hint. It is never
+      // parsed, never compared across peers, and never treated as identity.
       !record?.deviceName.isNullOrEmpty() -> record!!.deviceName!!
       else -> ""
     }
@@ -1016,31 +1215,86 @@ class BleMeshModule : Module() {
     }
   }
 
+  /**
+   * Starts service discovery exactly once per link. Two callers race for it -
+   * `onMtuChanged` and the MTU grace timer - and discovering twice on the same
+   * connection produces a second `onServicesDiscovered`, a second CCCD write and
+   * a second HELLO on some stacks.
+   */
+  private fun startDiscovery(link: Link, gatt: BluetoothGatt) {
+    if (link.discoveryStarted) return
+    link.discoveryStarted = true
+    if (!runCatching { gatt.discoverServices() }.getOrDefault(false)) {
+      emitError(
+        BleErrorCode.CONNECT_FAILED,
+        "Service discovery could not be started for '${link.peerId}'."
+      )
+      dropLink(link.peerId, announce = true)
+    }
+  }
+
   private val gattClientCallback = object : BluetoothGattCallback() {
     override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
       handler.post {
         val peerId = peerIdFor("c", gatt.device.address)
+        val link = links[peerId]
         if (newState == BluetoothProfile.STATE_CONNECTED &&
           status == BluetoothGatt.GATT_SUCCESS
         ) {
-          // MTU first, service discovery second. Requesting the MTU after
-          // discovery works but the characteristics then cache the old value on
-          // some stacks, and we would frame every chunk at 20 bytes forever.
-          if (!gatt.requestMtu(REQUESTED_MTU)) gatt.discoverServices()
+          if (link == null) {
+            // The link was already dropped (HELLO timeout, teardown, duplicate
+            // resolution) while the connect was in flight. Nothing will ever
+            // clean this BluetoothGatt up but us, and an unclosed one leaks the
+            // binder that eventually turns every connectGatt into a 133.
+            runCatching { gatt.disconnect() }
+            runCatching { gatt.close() }
+            return@post
+          }
+
+          // Ask for the bigger MTU first: requesting it *after* discovery works,
+          // but the characteristics cache the old value on some stacks and we
+          // would frame every chunk at 20 bytes forever.
+          //
+          // Do NOT gate discovery on onMtuChanged, though. A stack that never
+          // delivers that callback would otherwise leave the link connected,
+          // undiscovered and permanently useless. A large MTU is an optimisation;
+          // the 23-byte default is slow, not broken.
+          val requested = runCatching { gatt.requestMtu(REQUESTED_MTU) }.getOrDefault(false)
+          if (requested) {
+            handler.postDelayed({
+              links[peerId]?.let { if (it === link) startDiscovery(link, gatt) }
+            }, MTU_GRACE_MS)
+          } else {
+            startDiscovery(link, gatt)
+          }
         } else {
-          dropLink(peerId, announce = true)
+          // Every terminal path closes. dropLink() does it for a link we still
+          // hold; a gatt with no link behind it has to be closed here or its slot
+          // is leaked for the life of the process.
+          if (link != null) {
+            if (!link.announced) noteConnectFailure(peerId)
+            dropLink(peerId, announce = true)
+          } else {
+            runCatching { gatt.close() }
+            noteConnectFailure(peerId)
+          }
         }
       }
     }
 
     override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
       handler.post {
-        val link = links[peerIdFor("c", gatt.device.address)]
-        // Three bytes of ATT overhead on every write. Floor at the pre-negotiation
-        // minimum: a stack that reports a nonsense MTU must not make us frame
-        // chunks that the radio then refuses.
-        link?.usableWrite = maxOf(MIN_USABLE_WRITE, mtu - 3)
-        gatt.discoverServices()
+        val peerId = peerIdFor("c", gatt.device.address)
+        val link = links[peerId] ?: return@post
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+          // Three bytes of ATT overhead on every write. Floor at the
+          // pre-negotiation minimum: a stack that reports a nonsense MTU must not
+          // make us frame chunks that the radio then refuses.
+          link.usableWrite = maxOf(MIN_USABLE_WRITE, mtu - 3)
+        }
+        // Whichever of this and the grace timer arrives first wins; the other is
+        // a no-op.
+        startDiscovery(link, gatt)
       }
     }
 
@@ -1396,8 +1650,36 @@ class BleMeshModule : Module() {
   // Emitting
   // -------------------------------------------------------------------------
 
+  /**
+   * Events are posted to the main looper, never emitted from the BLE thread.
+   *
+   * A dropped event is not a cosmetic failure: it is a peer the UI never learns
+   * about, or a payload that arrived on the radio and then evaporated. So the
+   * failure is logged rather than swallowed, and - unless the thing that failed
+   * was itself the error channel - reported on `onError` as well.
+   */
   private fun emit(name: String, body: Bundle) {
-    runCatching { sendEvent(name, body) }
+    mainHandler.post { deliver(name, body) }
+  }
+
+  private fun deliver(name: String, body: Bundle) {
+    try {
+      sendEvent(name, body)
+    } catch (error: Throwable) {
+      Log.e(LOG_TAG, "sendEvent('$name') failed", error)
+      if (name == "onError") return
+      try {
+        sendEvent(
+          "onError",
+          bundleOf(
+            "code" to BleErrorCode.INTERNAL,
+            "message" to "Failed to deliver '$name': ${describe(error)}"
+          )
+        )
+      } catch (nested: Throwable) {
+        Log.e(LOG_TAG, "sendEvent('onError') failed too", nested)
+      }
+    }
   }
 
   private fun emitError(code: String, message: String) {
