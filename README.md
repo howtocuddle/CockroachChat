@@ -1,56 +1,186 @@
-# Welcome to your Expo app 👋
+# protestchat
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Off-grid messaging for internet shutdowns and jammed protests. Phones talk directly to each other over Bluetooth LE and Wi-Fi Direct — no cell tower, no ISP, no server, no account.
 
-## Get started
+Built after Delhi Police deployed portable cellular jammers at Jantar Mantar on 20 July 2026 alongside an unpublished mobile internet restriction. **Those jammers target 3G/4G/5G only.** 2.4 GHz is untouched, so two phones standing next to each other were still perfectly capable of talking — there was just no user-friendly & acessible app to do it.
 
-1. Install dependencies
+## How it works
 
-   ```bash
-   npm install
-   ```
-
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
-```bash
-npm run reset-project
+```
+┌──────────────── shared TypeScript (~85%) ────────────────┐
+│  UI · SQLite · sealing · dedup · relay · expiry          │
+├──────────────────────────┬───────────────────────────────┤
+│  Swift (iOS)             │  Kotlin (Android)             │
+│  Nearby Connections      │  Nearby Connections           │
+└──────────────────────────┴───────────────────────────────┘
+              BLE / Wi-Fi Direct — no tower, no ISP
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+The native layer is a **dumb byte pipe**: advertise, discover, connect, send bytes, receive bytes. It contains no chat logic, no storage, and no crypto, so there is exactly one implementation of the security-critical code to audit rather than three that drift apart.
 
-### Other setup steps
+Routing is **epidemic, not addressed**. There are no routing tables, because a routing table is a map of who talks to whom. Every phone carries every unexpired envelope it has seen and offers it to every peer it meets; the recipient is simply whoever can decrypt it. This costs battery and bandwidth and buys the property that a captured phone reveals nothing about who was talking to whom.
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+It also means **a phone is a courier**. Someone who walks out of a jammed zone carries queued messages with them and delivers them on the other side.
 
-## Learn more
+## Four ways to send
 
-To learn more about developing your project with Expo, look at the following resources:
+| | Who reads it | Use it for |
+|---|---|---|
+| **Everyone nearby** | Anyone in range, **including police running this app** | Crowd warnings: "exit blocked at gate 4" |
+| **Channel** | Anyone with the passphrase | An affinity group that needs to grow by word of mouth |
+| **Group** | Only the people you added | Your actual crew |
+| **Direct** | One person | Everything sensitive |
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+Channels have **no owner, no admin, no kick** — a channel is a passphrase and nothing else. That is deliberate: BitChat's channel commands were validated only by the issuing client, so any member could seize a channel or strip its encryption. A construct with no privileged operations has none to forge. The cost is that a leaked passphrase ends the channel; start a new one.
 
-## Join the community
+Groups are **fan-out** — one separately sealed copy per member, no shared group key, so there is no rekeying problem and no group cryptography to get wrong. Capped at 15 people because each message costs N transmissions over a radio Google documents as low-bandwidth.
 
-Join our community of developers creating universal apps.
+## Layout
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+```
+src/lib/
+  crypto-core.ts    sealing + channel keys — pure, no RN imports, fully tested
+  crypto.ts         keystore wrapper around crypto-core
+  protocol.ts       wire format, padding, expiry
+  db.ts             SQLite: messages, contacts, channels, groups, envelope cache
+  store.ts          MeshStore interface — lets the engine run against memory in tests
+  mesh.ts           the engine — sealing, dedup, store-and-forward, relay
+  transport.ts      radio abstraction (Nearby today, LoRa/gateway later)
+  conversation.ts   derives the mode and its warning, in ONE place
+  app-state.tsx     React bindings
+src/app/            home, chat/[id], add, verify/[id], join-channel, new-group, settings
+modules/nearby-mesh/    the Swift + Kotlin native module
+scripts/doctor.sh       checks your build toolchain and names the fix for anything missing
+docs/THREAT-MODEL.md
+```
+
+`mesh.ts` takes its transport and store by injection, so the whole engine — relaying, dedup, hop limits, channels, fan-out — is exercised by `npm test` with no radio and no phone.
+
+## Build it
+
+**Expo Go will not work** — it cannot load custom native Bluetooth code. You need a development build, which means Xcode and/or Android Studio.
+
+```bash
+npm install
+npm run doctor      # checks the toolchain, names the fix for anything missing
+
+npm test            # 72 tests — crypto, wire format, mesh logic. No device needed.
+npm run typecheck
+
+npm run android     # Android phone over USB
+npm run ios         # iPhone over USB
+```
+
+`npm run doctor` exists because the two usual blockers — `xcode-select` pointing at CommandLineTools, and Android Studio never having downloaded its SDK — both fail with errors that do not name the fix.
+
+The first native build takes several minutes. After that JavaScript hot-reloads; Swift or Kotlin changes need a rebuild.
+
+### Platform status
+
+| | State |
+|---|---|
+| **Android** | Builds. Kotlin module compiles against `play-services-nearby`. |
+| **iOS** | **Blocked.** See below. |
+
+**iOS is blocked on a real upstream gap:** Google ships Nearby Connections for iOS via Swift Package Manager only, with [no CocoaPods support](https://github.com/google/nearby/issues/1685) — an open request since May 2023, explicitly filed because React Native and Flutter plugin systems depend on CocoaPods. `pod install` therefore fails with `Unable to find a specification for NearbyConnections`.
+
+This is not a version typo and cannot be fixed by changing the podspec version. Options, in order of preference:
+
+1. **`spm_dependency` in the podspec.** Expo's autolinking understands SPM dependencies declared from a local module. Least invasive; try this first.
+2. **A config plugin that injects the SPM package** into the generated Xcode project, so `prebuild` does not wipe it.
+3. **Write our own BLE transport** with CoreBluetooth on iOS and BLE GATT on Android, dropping Nearby entirely. Most work, no dependency on Google shipping anything, and full control of the advertising identifiers we currently cannot rotate. This is roughly what Bridgefy and BitChat do.
+
+### Permissions
+
+`prebuild` pulls `RECORD_AUDIO`, `SYSTEM_ALERT_WINDOW` and legacy storage permissions in from Expo defaults. A protest app requesting microphone access is bad optics and real attack surface, so `app.json` blocks them via `android.blockedPermissions`. **Re-check after any `prebuild`** — run `npm run doctor` and inspect `android/app/src/main/AndroidManifest.xml` for `tools:node="remove"`.
+
+`INTERNET` is still requested because Metro needs it in development. A release build should drop it: an app that physically cannot open a socket is a much stronger claim than one that promises not to.
+
+## Test it — the milestone that matters
+
+### What is automated
+
+| Layer | Automated | How |
+|---|---|---|
+| Crypto, channel keys, wire format | yes | `npm test` |
+| Mesh logic — relay, dedup, hop limits, fan-out, store-and-forward | yes | `npm test`, engines wired through a fake transport |
+| Kotlin compiles | yes | `npm run android` (or `cd android && ./gradlew :app:assembleDebug`) |
+| Swift compiles | blocked | see the iOS gap above |
+| App installs and launches | yes | `npm run android` / `npm run ios` |
+| **The radio actually finding a peer** | **no** | two physical phones, by hand |
+
+**The mesh cannot be tested in a simulator or emulator.** Neither has a real Bluetooth radio — Nearby will initialise and then discover nothing, forever. There is no emulator trick for this. Everything below needs two phones in the same room.
+
+### The manual part
+
+The whole point is one thing working, so test exactly that first.
+
+**Setup.** Install the build on two phones (one iPhone and one Android is the interesting case). Grant Bluetooth, Location and Nearby-devices permissions on Android; Bluetooth and Local Network on iOS. Keep the app in the **foreground** on both — background BLE is an unsolved problem, see the threat model.
+
+**1. Cut the network for real.**
+
+Airplane mode on both phones, then manually turn Bluetooth back on (and Wi-Fi, which Nearby uses for its fast path — just do not join a network). Confirm you genuinely have no connectivity: open a browser, load anything, watch it fail.
+
+**2. Introduce the two phones.**
+
+- Phone A: **Add a person → My code**
+- Phone B: **Add a person → Scan theirs**, point it at A's screen
+- Repeat in the other direction so each has the other
+
+Do this standing next to each other. This in-person step is the entire trust model — there is no server to vouch for anyone.
+
+**3. Verify.**
+
+Open the chat, tap the amber **Not verified yet** strip, and check both phones show the same 15 digits. Mark verified. If they differ, someone is in the middle.
+
+**4. Send.**
+
+The banner at the top of the home screen should read **Connected to 1 phone**. Send a message. It should arrive in a second or two, with no internet on either device.
+
+**5. Now test the parts that actually matter.**
+
+| Test | Expected |
+|---|---|
+| Walk out of range, send, walk back | Shows "Waiting for someone in range", then delivers on reconnect |
+| Force-quit and reopen | History intact, radio comes back up on its own |
+| Send while the other phone is fully off | Queues; delivers when it returns |
+| Three phones, A and C never in range of each other | B relays. **This is the mesh working.** |
+| Both phones join channel `gate4` with the same passphrase | Messages appear for both, with sender names |
+| One phone joins `gate4` with the *wrong* passphrase | Sees nothing. It relays the traffic but cannot read it |
+| Send in "Everyone nearby" | Every phone with the app sees it, contact or not |
+| Make a group of 3, send once | All members receive it; non-members see nothing |
+| Leave a phone idle 6 hours | Envelopes expire and disappear |
+| Settings → panic wipe | Everything gone, new identity, radio back up |
+
+Row 4 is the real proof — it is the difference between a mesh and a Bluetooth demo. Rows 5–8 cover the modes added after the first build.
+
+The channel test worth doing deliberately: join `gate4` on two phones with the same passphrase and on a third with the *wrong* one. The third should see nothing while still relaying the traffic — that demonstrates confidentiality and relaying are genuinely independent, which is the core claim of the design.
+
+## What is not built yet
+
+- Background relaying (iOS suspends BLE aggressively — the biggest open problem)
+
+- Images
+- Rotating BLE identifiers — the endpoint id is currently stable and trackable
+- Argon2id for channel passphrases (currently scrypt N=2^14, see the threat model)
+- Any passphrase strength enforcement
+- Synchronised group membership — your member list is local only
+- Sybil / flood resistance
+- Duress PIN and decoy mode
+- Reproducible builds
+- Any independent security audit
+
+## Contributing
+
+Most useful right now, in order:
+
+1. Applied cryptographers — the lack of forward secrecy is the top open question
+2. Anyone who has shipped cross-platform Nearby Connections
+3. Anyone who has been in a shutdown or jammed protest — what would you actually have used?
+4. Anyone who wants to co-write the threat model
+
+Security findings get published with credit. We would much rather hear it from you than read it in a paper written after people relied on this — which is exactly what happened to Bridgefy, which protesters in Hong Kong and during the CAA protests used while it was [comprehensively broken](https://eprint.iacr.org/2021/214).
+
+## Licence
+
+AGPL-3.0. Security software that protesters are asked to trust has to be readable by the people being asked to trust it.

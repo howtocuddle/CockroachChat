@@ -1,0 +1,42 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <!--
+    Bluetooth LE only. No Wi-Fi permissions, no NEARBY_WIFI_DEVICES and no
+    Play services: this transport talks GATT directly, so it needs strictly less
+    than nearby-mesh did.
+  -->
+
+  <!-- Legacy Bluetooth (pre-Android 12). Install-time, not runtime. -->
+  <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+  <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+
+  <!--
+    Android 12+ (API 31) Bluetooth split, all runtime.
+
+    BLUETOOTH_SCAN is declared neverForLocation. That is a real assertion, not a
+    convenience: this module never derives location from a scan result, never
+    reads RSSI for ranging, and never persists a scan record. Declaring it means
+    the app does NOT have to hold ACCESS_FINE_LOCATION on Android 12+, which
+    matters for a protest app twice over - it is one fewer permission a user has
+    to grant while standing in a crowd, and one fewer capability an attacker who
+    compromises the app inherits.
+  -->
+  <uses-permission
+    android:name="android.permission.BLUETOOTH_SCAN"
+    android:usesPermissionFlags="neverForLocation" />
+  <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+  <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+  <!--
+    API <= 30 has no neverForLocation escape hatch: a BLE scan there returns no
+    results at all without location permission AND with Location Services
+    switched on at the OS level. Bounded so it is never requested on 31+.
+  -->
+  <uses-permission
+    android:name="android.permission.ACCESS_FINE_LOCATION"
+    android:maxSdkVersion="30" />
+
+  <!-- BLE, and specifically the peripheral role, are both required. -->
+  <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+
+</manifest>

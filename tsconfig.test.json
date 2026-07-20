@@ -1,0 +1,12 @@
+{
+  // Tests run under Node, app code runs under Hermes. Keeping the two type
+  // environments separate stops Node globals from silently becoming available
+  // to app code that would then crash on a phone.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": ["src/lib/**/*.ts"],
+  "exclude": ["node_modules"]
+}

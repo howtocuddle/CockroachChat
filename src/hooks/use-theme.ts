@@ -1,14 +1,18 @@
+import { useColorScheme } from 'react-native';
+
+import { Colors, type Theme } from '@/constants/theme';
+
+export function useTheme(): Theme {
+  // Dark is the default: it costs less battery and is less visible over your
+  // shoulder. Light is used only when the OS explicitly asks for it.
+  return useColorScheme() === 'light' ? Colors.light : Colors.dark;
+}
+
 /**
- * Learn more about light and dark modes:
- * https://docs.expo.dev/guides/color-schemes/
+ * Some decisions differ between schemes beyond a colour swap — a scrim that
+ * darkens on dark and lightens on light, for instance. Those need to know
+ * which scheme they are in, not just which tokens they got.
  */
-
-import { Colors } from '@/constants/theme';
-import { useColorScheme } from '@/hooks/use-color-scheme';
-
-export function useTheme() {
-  const scheme = useColorScheme();
-  const theme = scheme === 'unspecified' ? 'light' : scheme;
-
-  return Colors[theme];
+export function useIsDark(): boolean {
+  return useColorScheme() !== 'light';
 }

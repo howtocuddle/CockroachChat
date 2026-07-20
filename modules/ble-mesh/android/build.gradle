@@ -1,0 +1,31 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.blemesh'
+version = '1.0.0'
+
+// Local module: never published to a maven repository.
+expoModule {
+  canBePublished = false
+}
+
+android {
+  namespace "expo.modules.blemesh"
+  defaultConfig {
+    minSdkVersion safeExtGet("minSdkVersion", 24)
+    versionCode 1
+    versionName "1.0.0"
+  }
+}
+
+// Deliberately no dependencies. Everything used here is android.bluetooth.le from
+// the platform, so this module works on a phone with no Google Play services at
+// all — which is the point, and is not true of nearby-mesh.
+dependencies {
+}
+
+def safeExtGet(prop, fallback) {
+  rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+}

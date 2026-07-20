@@ -1,0 +1,536 @@
+/**
+ * The whole component vocabulary.
+ *
+ * Kept deliberately small: every extra control is another thing to understand
+ * under stress, and a screen built from a handful of known pieces is a screen
+ * that behaves the same everywhere.
+ *
+ * Two rules are enforced here rather than left to call sites, because leaving
+ * them to call sites is how they get lost:
+ *
+ *   - `Tag` will not render a colour without a word. Colour is never the only
+ *     signal — it is the first thing to fail in direct sun and it fails
+ *     entirely for a colour-blind user.
+ *   - Everything pressable is at least TAP_TARGET tall. One-handed, under
+ *     stress, possibly while moving.
+ */
+
+import { forwardRef, type ReactNode } from 'react';
+import {
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+  type PressableProps,
+  type TextInputProps,
+  type ViewProps,
+} from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+import { Radius, Spacing, TAP_TARGET, Type, type ToneColors, type ToneName } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
+
+// ---------------------------------------------------------------------------
+// Screen
+
+/**
+ * The standard page body. Exists so every screen inherits the same horizontal
+ * rhythm and the same bottom inset instead of re-deriving them, which is what
+ * made the old screens drift by a few points from one another.
+ */
+export function Screen({
+  children,
+  scroll = true,
+  footer,
+  contentStyle,
+}: {
+  children: ReactNode;
+  scroll?: boolean;
+  /** Pinned above the home indicator. Use for the one primary action. */
+  footer?: ReactNode;
+  contentStyle?: ViewProps['style'];
+}) {
+  const t = useTheme();
+  const insets = useSafeAreaInsets();
+
+  const padding = {
+    paddingHorizontal: Spacing.lg,
+    paddingTop: Spacing.lg,
+    paddingBottom: insets.bottom + (footer ? TAP_TARGET + Spacing.xxl : Spacing.xxl),
+  };
+
+  return (
+    <View style={{ flex: 1, backgroundColor: t.bg }}>
+      {scroll ? (
+        <ScrollView
+          contentContainerStyle={[padding, contentStyle]}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="interactive">
+          {children}
+        </ScrollView>
+      ) : (
+        <View style={[{ flex: 1 }, padding, contentStyle]}>{children}</View>
+      )}
+
+      {footer && (
+        <View
+          style={[
+            styles.footer,
+            {
+              backgroundColor: t.bg,
+              borderColor: t.border,
+              paddingBottom: insets.bottom + Spacing.md,
+            },
+          ]}>
+          {footer}
+        </View>
+      )}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Button
+
+type ButtonProps = PressableProps & {
+  title: string;
+  variant?: 'primary' | 'secondary' | 'danger' | 'quiet';
+};
+
+export function Button({ title, variant = 'primary', disabled, style, ...rest }: ButtonProps) {
+  const t = useTheme();
+
+  const bg =
+    variant === 'primary'
+      ? t.accentFill
+      : variant === 'danger'
+        ? t.tone.danger.fill
+        : variant === 'secondary'
+          ? t.surfaceRaised
+          : 'transparent';
+
+  const fg =
+    variant === 'primary' || variant === 'danger'
+      ? t.onAccentFill
+      : variant === 'quiet'
+        ? t.accent
+        : t.text;
+
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={title}
+      accessibilityState={{ disabled: !!disabled }}
+      disabled={disabled}
+      style={(state) => [
+        styles.button,
+        {
+          backgroundColor: bg,
+          // Pressed feedback is opacity only. A scale or a bounce on the send
+          // button would be one more thing moving on a screen someone is
+          // trying to read quickly.
+          opacity: disabled ? 0.4 : state.pressed ? 0.72 : 1,
+        },
+        typeof style === 'function' ? style(state) : style,
+      ]}
+      {...rest}>
+      <Text style={[Type.bodyStrong, { color: fg }]} numberOfLines={1}>
+        {title}
+      </Text>
+    </Pressable>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Input
+
+export const Input = forwardRef<TextInput, TextInputProps>(function Input(props, ref) {
+  const t = useTheme();
+  return (
+    <TextInput
+      ref={ref}
+      placeholderTextColor={t.textMuted}
+      // Off across the board: this text is not for a keyboard vendor's cloud.
+      autoCorrect={false}
+      autoCapitalize="none"
+      spellCheck={false}
+      {...props}
+      style={[
+        styles.input,
+        { backgroundColor: t.surface, borderColor: t.border, color: t.text },
+        props.style,
+      ]}
+    />
+  );
+});
+
+/** Label + input + hint, as one unit, so the three never drift apart. */
+export function Field({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: ReactNode;
+}) {
+  const t = useTheme();
+  return (
+    <View style={{ gap: Spacing.sm }}>
+      <Text style={[Type.label, { color: t.textMuted }]}>{label.toUpperCase()}</Text>
+      {children}
+      {!!hint && <Text style={[Type.caption, { color: t.textMuted }]}>{hint}</Text>}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Containers
+
+export function Card({ style, ...rest }: ViewProps) {
+  const t = useTheme();
+  return (
+    <View
+      style={[styles.card, { backgroundColor: t.surface, borderColor: t.border }, style]}
+      {...rest}
+    />
+  );
+}
+
+/**
+ * A grouped list. Owns its own separators so screens stop hand-rolling
+ * `{i > 0 && <Separator />}`, and so a list never ends up nested inside a card
+ * inside another card.
+ */
+export function List({ children }: { children: ReactNode }) {
+  const t = useTheme();
+  const items = Array.isArray(children) ? children.filter(Boolean) : [children];
+
+  return (
+    <View style={[styles.list, { backgroundColor: t.surface, borderColor: t.border }]}>
+      {items.map((child, i) => (
+        // eslint-disable-next-line react/no-array-index-key
+        <View key={i}>
+          {i > 0 && (
+            <View
+              style={[styles.sep, { backgroundColor: t.border, marginLeft: Spacing.lg }]}
+            />
+          )}
+          {child}
+        </View>
+      ))}
+    </View>
+  );
+}
+
+export function Row({
+  title,
+  subtitle,
+  tag,
+  leading,
+  onPress,
+  accessibilityLabel,
+}: {
+  title: string;
+  subtitle?: string;
+  tag?: ReactNode;
+  leading?: ReactNode;
+  onPress?: () => void;
+  accessibilityLabel?: string;
+}) {
+  const t = useTheme();
+  return (
+    <Pressable
+      accessibilityRole={onPress ? 'button' : undefined}
+      accessibilityLabel={accessibilityLabel}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.row,
+        { backgroundColor: pressed && onPress ? t.surfaceRaised : 'transparent' },
+      ]}>
+      {leading}
+      <View style={{ flex: 1, gap: 3 }}>
+        <View style={styles.rowTitleLine}>
+          <Text style={[Type.bodyStrong, { color: t.text, flexShrink: 1 }]} numberOfLines={1}>
+            {title}
+          </Text>
+          {tag}
+        </View>
+        {!!subtitle && (
+          <Text style={[Type.caption, { color: t.textMuted }]} numberOfLines={1}>
+            {subtitle}
+          </Text>
+        )}
+      </View>
+    </Pressable>
+  );
+}
+
+/**
+ * A neutral monogram. Deliberately not colour-coded by identity: a per-person
+ * hue would look like a trust signal, and nothing about a contact's colour
+ * tells you whether you verified them.
+ */
+export function Monogram({ name }: { name: string }) {
+  const t = useTheme();
+  const initial = name.trim().charAt(0).toUpperCase() || '?';
+  return (
+    <View
+      // Decorative — the name is right beside it in text.
+      accessibilityElementsHidden
+      importantForAccessibility="no-hide-descendants"
+      style={[styles.monogram, { backgroundColor: t.surfaceRaised, borderColor: t.border }]}>
+      <Text style={[Type.calloutStrong, { color: t.textMuted }]}>{initial}</Text>
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Status
+
+/**
+ * The colour-plus-word marker used wherever a state is shown.
+ *
+ * `label` is required and there is no icon-only variant, by design. Two of the
+ * four conversation modes are not private, and a user who reads only the colour
+ * would have to guess which. No padlocks: a padlock reads as "safe", and it
+ * would be a lie on half this app's surface area.
+ */
+export function Tag({ tone, label }: { tone: ToneName; label: string }) {
+  const t = useTheme();
+  const c: ToneColors = t.tone[tone];
+  return (
+    <View style={[styles.tag, { backgroundColor: c.tint, borderColor: c.edge }]}>
+      <View style={[styles.tagDot, { backgroundColor: c.fg }]} />
+      <Text style={[Type.micro, { color: c.fg }]} numberOfLines={1}>
+        {label.toUpperCase()}
+      </Text>
+    </View>
+  );
+}
+
+/**
+ * A toned callout. `loud` swaps the quiet tint for a solid fill, which is how
+ * public broadcast gets to be unmistakable while a merely-imperfect state
+ * stays readable rather than screaming.
+ */
+export function Notice({
+  tone,
+  title,
+  children,
+  loud = false,
+  style,
+}: {
+  tone: ToneName;
+  title?: string;
+  children?: ReactNode;
+  loud?: boolean;
+  style?: ViewProps['style'];
+}) {
+  const t = useTheme();
+  const c = t.tone[tone];
+  return (
+    <View
+      style={[
+        styles.notice,
+        {
+          backgroundColor: loud ? c.fill : c.tint,
+          borderColor: loud ? c.fill : c.edge,
+        },
+        style,
+      ]}>
+      {!!title && (
+        <Text style={[Type.calloutStrong, { color: loud ? c.onFill : c.fg }]}>
+          {title.toUpperCase()}
+        </Text>
+      )}
+      {children}
+    </View>
+  );
+}
+
+/** The bulleted honest-limitations style used on Settings and Join channel. */
+export function Bullets({ items, color }: { items: string[]; color?: string }) {
+  const t = useTheme();
+  return (
+    <View style={{ gap: Spacing.sm }}>
+      {items.map((line) => (
+        <View key={line} style={{ flexDirection: 'row', gap: Spacing.sm }}>
+          <Text style={[Type.callout, { color: color ?? t.textMuted }]}>—</Text>
+          <Text style={[Type.callout, { color: color ?? t.textMuted, flex: 1 }]}>{line}</Text>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Structure
+
+export function SectionHeader({
+  title,
+  action,
+  onAction,
+}: {
+  title: string;
+  action?: string;
+  onAction?: () => void;
+}) {
+  const t = useTheme();
+  return (
+    <View style={styles.sectionHeader}>
+      <Text
+        accessibilityRole="header"
+        style={[Type.label, { color: t.textMuted }]}>
+        {title.toUpperCase()}
+      </Text>
+      {!!action && !!onAction && (
+        <Pressable
+          hitSlop={16}
+          onPress={onAction}
+          accessibilityRole="button"
+          accessibilityLabel={`${action} ${title.toLowerCase()}`}>
+          {({ pressed }) => (
+            <Text style={[Type.label, { color: t.accent, opacity: pressed ? 0.6 : 1 }]}>
+              {action.toUpperCase()}
+            </Text>
+          )}
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+/**
+ * Empty states teach rather than apologise. Every one of these says what the
+ * thing is for and what to do next, because the moment someone first opens
+ * this app is very unlikely to be a calm one.
+ */
+export function Empty({
+  title,
+  detail,
+  action,
+  onAction,
+}: {
+  title: string;
+  detail: string;
+  action?: string;
+  onAction?: () => void;
+}) {
+  const t = useTheme();
+  return (
+    <View style={styles.empty}>
+      <Text style={[Type.heading, { color: t.text, textAlign: 'center' }]}>{title}</Text>
+      <Text
+        style={[
+          Type.callout,
+          { color: t.textMuted, textAlign: 'center', maxWidth: 320, marginTop: Spacing.sm },
+        ]}>
+        {detail}
+      </Text>
+      {!!action && !!onAction && (
+        <Button
+          title={action}
+          variant="quiet"
+          onPress={onAction}
+          style={{ marginTop: Spacing.sm }}
+        />
+      )}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+const styles = StyleSheet.create({
+  footer: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    paddingHorizontal: Spacing.lg,
+    paddingTop: Spacing.md,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  button: {
+    minHeight: TAP_TARGET,
+    borderRadius: Radius.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: Spacing.xl,
+  },
+  input: {
+    minHeight: TAP_TARGET,
+    borderRadius: Radius.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: Spacing.lg,
+    paddingVertical: Spacing.md,
+    fontSize: Type.body.fontSize,
+    lineHeight: Type.body.lineHeight,
+  },
+  card: {
+    borderRadius: Radius.lg,
+    borderWidth: StyleSheet.hairlineWidth,
+    padding: Spacing.lg,
+  },
+  list: {
+    borderRadius: Radius.lg,
+    borderWidth: StyleSheet.hairlineWidth,
+    overflow: 'hidden',
+  },
+  sep: { height: StyleSheet.hairlineWidth },
+  row: {
+    minHeight: TAP_TARGET + 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.md,
+    paddingHorizontal: Spacing.lg,
+    paddingVertical: Spacing.md,
+  },
+  rowTitleLine: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.sm,
+  },
+  monogram: {
+    width: 40,
+    height: 40,
+    borderRadius: Radius.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  tag: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.xs + 2,
+    paddingHorizontal: Spacing.sm,
+    paddingVertical: 3,
+    borderRadius: Radius.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  tagDot: { width: 6, height: 6, borderRadius: 3 },
+  notice: {
+    borderRadius: Radius.lg,
+    borderWidth: 1,
+    padding: Spacing.lg,
+    gap: Spacing.sm,
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    minHeight: TAP_TARGET - 12,
+    marginTop: Spacing.xl,
+    marginBottom: Spacing.sm,
+    paddingHorizontal: Spacing.xs,
+  },
+  empty: {
+    paddingVertical: Spacing.xxl,
+    paddingHorizontal: Spacing.lg,
+    alignItems: 'center',
+  },
+});
