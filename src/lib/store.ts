@@ -16,7 +16,7 @@
  */
 
 import { fromBase64, toBase64 } from './bytes';
-import type { Envelope } from './protocol';
+import type { Envelope, SignalSeverity } from './protocol';
 import { decodeEnvelope, encodeEnvelope } from './protocol';
 
 export type MessageState = 'queued' | 'sent' | 'delivered' | 'failed';
@@ -31,6 +31,12 @@ export type Message = {
   text: string;
   sentAt: number;
   state: MessageState;
+  /**
+   * Set only for preset signals, and only ever 'danger' or 'caution' — there is
+   * no safe severity (danger-monotone). Absent for ordinary text, which the UI
+   * renders untinted.
+   */
+  severity?: SignalSeverity | null;
 };
 
 /**

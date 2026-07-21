@@ -621,6 +621,36 @@ describe('channels', () => {
         [['#public', 'police at the east exit']],
       );
     }));
+
+  it('carries a preset signal, tinted, to holders and nobody else', () =>
+    scenario(['A', 'B', 'C'], async ({ A, B, C }, world) => {
+      // C sits between A and B and holds the wrong key, so it must relay a
+      // signal it cannot read.
+      world.connect('A', 'C');
+      world.connect('C', 'B');
+      A.engine.setChannelKeys([{ id: 'chan', key: channelKey }]);
+      B.engine.setChannelKeys([{ id: 'chan', key: channelKey }]);
+      C.engine.setChannelKeys([{ id: 'other', key: otherKey }]);
+      await world.settle();
+
+      await A.engine.sendSignalToChannel('chan', channelKey, 'police', 'Gate 4', 'danger');
+      await world.settle();
+
+      const got = inbox(B);
+      assert.equal(got.length, 1);
+      assert.equal(got[0].severity, 'danger');
+      assert.ok(got[0].text.includes('Police'));
+      assert.ok(got[0].text.includes('Gate 4'));
+      assert.equal(got[0].peerId, '#chan');
+
+      // The sender files its own tinted copy under the channel too.
+      const own = A.store.messages.filter((m) => m.outgoing && m.peerId === '#chan');
+      assert.equal(own.length, 1);
+      assert.equal(own[0].severity, 'danger');
+
+      // The relay held the wrong key and understood nothing.
+      assert.deepEqual(C.store.messages, []);
+    }));
 });
 
 describe('groups', () => {

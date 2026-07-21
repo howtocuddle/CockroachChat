@@ -168,4 +168,51 @@ describe('message bodies', () => {
       assert.equal(decodeBody(junk), null);
     }
   });
+
+  it('round-trips a danger signal', () => {
+    const body = {
+      kind: 'signal',
+      event: 'police',
+      location: 'gate-4',
+      severity: 'danger',
+      sentAt: 123,
+    } as const;
+    assert.deepEqual(decodeBody(encodeBody(body)), body);
+  });
+
+  it('round-trips a caution signal', () => {
+    const body = {
+      kind: 'signal',
+      event: 'crowd-crush',
+      location: 'main-square',
+      severity: 'caution',
+      sentAt: 7,
+    } as const;
+    assert.deepEqual(decodeBody(encodeBody(body)), body);
+  });
+
+  it('danger-monotone: drops any signal claiming safety', () => {
+    // A forged all-clear is the one lie that walks people into a trap, so the
+    // decoder must refuse every severity outside danger/caution.
+    for (const severity of ['safe', 'clear', 'all-clear', 'ok', 'green', '']) {
+      const raw = JSON.stringify({
+        kind: 'signal',
+        event: 'gate',
+        location: 'gate-4',
+        severity,
+        sentAt: 1,
+      });
+      assert.equal(decodeBody(raw), null);
+    }
+  });
+
+  it('rejects a signal missing a required field', () => {
+    for (const raw of [
+      JSON.stringify({ kind: 'signal', event: 'police', severity: 'danger', sentAt: 1 }),
+      JSON.stringify({ kind: 'signal', location: 'gate-4', severity: 'danger', sentAt: 1 }),
+      JSON.stringify({ kind: 'signal', event: 'police', location: 'gate-4', severity: 'danger' }),
+    ]) {
+      assert.equal(decodeBody(raw), null);
+    }
+  });
 });

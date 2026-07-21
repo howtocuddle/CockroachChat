@@ -75,6 +75,9 @@ export function MessageBubble({
   const t = useTheme();
   const mine = message.outgoing;
   const failed = message.state === 'failed';
+  // A preset signal is tinted by severity; ordinary text is not. severity is
+  // only ever 'danger' or 'caution' (danger-monotone), so there is no safe tint.
+  const signal = message.severity ? t.tone[message.severity] : null;
 
   const corner = {
     borderTopLeftRadius: mine ? Radius.lg : joined ? Radius.sm : Radius.lg,
@@ -109,10 +112,13 @@ export function MessageBubble({
         style={[
           styles.bubble,
           corner,
-          { backgroundColor: mine ? t.bubbleOut : t.bubbleIn },
+          { backgroundColor: signal ? signal.tint : mine ? t.bubbleOut : t.bubbleIn },
+          signal && { borderWidth: 1, borderColor: signal.edge },
           failed && { borderWidth: 1, borderColor: t.tone.danger.fg },
         ]}>
-        <Text selectable style={[Type.body, { color: mine ? t.onBubbleOut : t.text }]}>
+        <Text
+          selectable
+          style={[Type.body, { color: signal ? signal.fg : mine ? t.onBubbleOut : t.text }]}>
           {message.text}
         </Text>
       </View>

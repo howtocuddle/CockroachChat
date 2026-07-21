@@ -53,12 +53,17 @@ src/lib/
   mesh.ts           the engine — sealing, dedup, store-and-forward, relay
   transport.ts      radio abstraction (our BLE GATT today, LoRa/gateway later)
   conversation.ts   derives the mode and its warning, in ONE place
+  signals.ts        preset danger/caution alerts (danger-monotone)
   app-state.tsx     React bindings
 src/app/            home, chat/[id], add, verify/[id], join-channel, new-group, settings
-modules/nearby-mesh/    the Swift + Kotlin native module
+modules/ble-mesh/       the Swift + Kotlin native module
 scripts/doctor.sh       checks your build toolchain and names the fix for anything missing
+docs/ARCHITECTURE.md    how it works end to end — the internals map
 docs/THREAT-MODEL.md
 ```
+
+For the full data path — a tap sealed, flooded, relayed, and opened — see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 `mesh.ts` takes its transport and store by injection, so the whole engine — relaying, dedup, hop limits, channels, fan-out — is exercised by `npm test` with no radio and no phone.
 
@@ -70,7 +75,7 @@ docs/THREAT-MODEL.md
 npm install
 npm run doctor      # checks the toolchain, names the fix for anything missing
 
-npm test            # 72 tests — crypto, wire format, mesh logic. No device needed.
+npm test            # 96 tests — crypto, wire format, mesh logic. No device needed.
 npm run typecheck
 
 npm run android     # Android phone over USB
@@ -140,7 +145,7 @@ Do this standing next to each other. This in-person step is the entire trust mod
 
 **3. Verify.**
 
-Open the chat, tap the amber **Not verified yet** strip, and check both phones show the same 15 digits. Mark verified. If they differ, someone is in the middle.
+Open the chat, tap the amber **Not verified yet** strip, and check both phones show the same 60-digit safety number (grouped in fives). Mark verified. If they differ, someone is in the middle.
 
 **4. Send.**
 

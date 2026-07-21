@@ -14,7 +14,7 @@
 
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FlatList, StyleSheet, Text, View } from 'react-native';
+import { FlatList, ScrollView, StyleSheet, Text, View } from 'react-native';
 import {
   KeyboardStickyView,
   useReanimatedKeyboardAnimation,
@@ -30,6 +30,7 @@ import { useTheme } from '@/hooks/use-theme';
 import { useApp } from '@/lib/app-state';
 import { describeConversation, type ConversationInfo } from '@/lib/conversation';
 import * as db from '@/lib/db';
+import { SIGNAL_PRESETS, type SignalPreset } from '@/lib/signals';
 
 export default function ChatScreen() {
   const t = useTheme();
@@ -38,7 +39,7 @@ export default function ChatScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const conversationId = decodeURIComponent(id ?? '');
 
-  const { contacts, conversations, channels, groups, sendText, status } = useApp();
+  const { contacts, conversations, channels, groups, sendText, sendSignal, status } = useApp();
   const contact = contacts.find((c) => c.publicId === conversationId);
   const group = conversationId.startsWith('~')
     ? groups.find((g) => g.id === conversationId.slice(1))
@@ -95,6 +96,27 @@ export default function ChatScreen() {
     setError(null);
     try {
       await sendText(conversationId, text);
+      setDraft('');
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not send.');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  // Preset signals are a broadcast affordance: they only make sense speaking to
+  // a crowd, not in a one-to-one chat.
+  const showSignals = info.mode === 'channel' || info.mode === 'public';
+
+  const onSignal = async (preset: SignalPreset) => {
+    if (sending) return;
+    setSending(true);
+    setError(null);
+    try {
+      // Whatever is already typed rides along as the location, so "Gate 4" then
+      // a tap on Police sends one alert instead of making the place a chore.
+      await sendSignal(conversationId, preset.event, draft.trim(), preset.severity);
       setDraft('');
       await load();
     } catch (err) {
@@ -188,6 +210,25 @@ export default function ChatScreen() {
           drops the resting safe-area padding once the keyboard covers the home
           indicator, so the input sits flush on the keys. */}
       <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
+        <View style={{ backgroundColor: t.bg }}>
+        {showSignals && (
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={styles.signals}>
+            {SIGNAL_PRESETS.map((preset) => (
+              <Button
+                key={preset.event}
+                title={preset.label}
+                variant={preset.severity === 'danger' ? 'danger' : 'secondary'}
+                onPress={() => void onSignal(preset)}
+                disabled={sending}
+                style={styles.signalButton}
+              />
+            ))}
+          </ScrollView>
+        )}
         <View
           style={[
             styles.composer,
@@ -215,6 +256,7 @@ export default function ChatScreen() {
             disabled={!draft.trim() || sending}
             style={{ paddingHorizontal: Spacing.lg }}
           />
+        </View>
         </View>
       </KeyboardStickyView>
     </View>
@@ -270,5 +312,14 @@ const styles = StyleSheet.create({
     gap: Spacing.sm,
     paddingHorizontal: Spacing.lg,
     paddingTop: Spacing.md,
+  },
+  signals: {
+    flexDirection: 'row',
+    gap: Spacing.sm,
+    paddingHorizontal: Spacing.lg,
+    paddingTop: Spacing.sm,
+  },
+  signalButton: {
+    paddingHorizontal: Spacing.lg,
   },
 });

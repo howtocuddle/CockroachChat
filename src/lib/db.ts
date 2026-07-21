@@ -79,7 +79,8 @@ async function openAndMigrate(): Promise<SQLite.SQLiteDatabase> {
       outgoing  INTEGER NOT NULL,
       text      TEXT NOT NULL,
       sent_at   INTEGER NOT NULL,
-      state     TEXT NOT NULL
+      state     TEXT NOT NULL,
+      severity  TEXT
     );
     CREATE INDEX IF NOT EXISTS messages_by_peer ON messages (peer_id, sent_at);
 
@@ -160,6 +161,12 @@ async function openAndMigrate(): Promise<SQLite.SQLiteDatabase> {
     );
   `);
 
+  // Additive migration for installs created before signals existed. SQLite has
+  // no "ADD COLUMN IF NOT EXISTS", so try it and swallow the duplicate-column
+  // error on later runs. Kept out of the CREATE block above, which executes as a
+  // single batch where a mid-statement failure would abort the whole schema.
+  await db.execAsync(`ALTER TABLE messages ADD COLUMN severity TEXT`).catch(() => {});
+
   return db;
 }
 
@@ -228,9 +235,9 @@ export async function getContact(publicId: string): Promise<Contact | null> {
 export async function insertMessage(m: Message): Promise<void> {
   const d = await getDb();
   await d.runAsync(
-    `INSERT OR IGNORE INTO messages (id, peer_id, sender_id, outgoing, text, sent_at, state)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [m.id, m.peerId, m.senderId, m.outgoing ? 1 : 0, m.text, m.sentAt, m.state],
+    `INSERT OR IGNORE INTO messages (id, peer_id, sender_id, outgoing, text, sent_at, state, severity)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [m.id, m.peerId, m.senderId, m.outgoing ? 1 : 0, m.text, m.sentAt, m.state, m.severity ?? null],
   );
 }
 
@@ -291,6 +298,7 @@ export async function listMessages(peerId: string, limit = 500): Promise<Message
     text: r.text,
     sentAt: r.sent_at,
     state: r.state as MessageState,
+    severity: (r.severity ?? null) as Message['severity'],
   }));
 }
 

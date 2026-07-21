@@ -168,6 +168,14 @@ export function unpad(padded: Uint8Array): Uint8Array | null {
 // Application-level message body (lives inside the sealed payload)
 // ---------------------------------------------------------------------------
 
+/**
+ * Signal severities. There is deliberately NO 'safe'/'clear'/'all-clear'
+ * member: danger-monotone means the mesh can raise caution but can never assert
+ * safety, because a forged all-clear is the lie that walks people into a trap.
+ * The absence is load-bearing — do not add a "safe" tone here.
+ */
+export type SignalSeverity = 'danger' | 'caution';
+
 export type MessageBody =
   /**
    * `id` is the SENDER's local message id, carried so the recipient has
@@ -183,7 +191,21 @@ export type MessageBody =
    *     readable rather than rejected.
    */
   | { kind: 'text'; text: string; sentAt: number; id?: string }
-  | { kind: 'receipt'; messageId: string; receivedAt: number };
+  | { kind: 'receipt'; messageId: string; receivedAt: number }
+  /**
+   * A preset situational-awareness signal: [event] at [location]. Its severity
+   * cannot express safety (see SignalSeverity), so a hostile channel member
+   * cannot forge an all-clear. decodeBody re-checks the severity because the
+   * body arrives from a sender we authenticated but do not trust.
+   */
+  | {
+      kind: 'signal';
+      event: string;
+      location: string;
+      severity: SignalSeverity;
+      sentAt: number;
+      id?: string;
+    };
 
 export const encodeBody = (b: MessageBody): string => JSON.stringify(b);
 
@@ -219,6 +241,35 @@ export function decodeBody(json: string): MessageBody | null {
       typeof parsed.receivedAt === 'number'
     ) {
       return { kind: 'receipt', messageId: parsed.messageId, receivedAt: parsed.receivedAt };
+    }
+
+    if (
+      parsed?.kind === 'signal' &&
+      typeof parsed.event === 'string' &&
+      typeof parsed.location === 'string' &&
+      typeof parsed.sentAt === 'number' &&
+      // Danger-monotone at the trust boundary: any severity outside this set —
+      // above all a forged 'safe'/'all-clear' — is dropped as a malformed body
+      // and never reaches the user. The mesh can raise caution, never safety.
+      (parsed.severity === 'danger' || parsed.severity === 'caution')
+    ) {
+      if (parsed.id !== undefined && typeof parsed.id !== 'string') return null;
+      return typeof parsed.id === 'string'
+        ? {
+            kind: 'signal',
+            event: parsed.event,
+            location: parsed.location,
+            severity: parsed.severity,
+            sentAt: parsed.sentAt,
+            id: parsed.id,
+          }
+        : {
+            kind: 'signal',
+            event: parsed.event,
+            location: parsed.location,
+            severity: parsed.severity,
+            sentAt: parsed.sentAt,
+          };
     }
 
     return null;

@@ -20,6 +20,7 @@ import { AppState } from 'react-native';
 
 import { RadioAccessGate } from '@/components/radio-access-gate';
 import type { Identity, PublicIdentity } from './crypto';
+import type { SignalSeverity } from './protocol';
 import {
   PUBLIC_CHANNEL_KEY,
   PUBLIC_CHANNEL_NAME,
@@ -59,6 +60,17 @@ type AppContextValue = {
    *   else   direct message to that publicId
    */
   sendText: (conversationId: string, text: string) => Promise<void>;
+
+  /**
+   * Broadcasts a preset danger/caution signal into a channel or public. There
+   * is no "safe"/"all-clear" severity by design — see SignalSeverity.
+   */
+  sendSignal: (
+    conversationId: string,
+    event: string,
+    location: string,
+    severity: SignalSeverity,
+  ) => Promise<void>;
 
   joinChannel: (name: string, passphrase: string) => Promise<db.Channel>;
   leaveChannel: (id: string) => Promise<void>;
@@ -196,6 +208,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [refresh, channels, groups],
   );
 
+  const sendSignal = useCallback(
+    async (conversationId: string, event: string, location: string, severity: SignalSeverity) => {
+      // Situational-awareness broadcast only. A signal is meaningless one-to-one,
+      // so it is restricted to channels and public here rather than left to the
+      // caller to remember.
+      if (!conversationId.startsWith('#')) {
+        throw new Error('Signals can only be sent to a channel or public.');
+      }
+      const channel = channels.find((c) => c.id === conversationId.slice(1));
+      if (!channel) throw new Error('You are not in that channel any more.');
+      await mesh.sendSignalToChannel(channel.id, channel.key, event, location, severity);
+      await refresh();
+    },
+    [refresh, channels],
+  );
+
   /**
    * Joins a channel, deriving its key from the name and passphrase.
    *
@@ -307,6 +335,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       startRadio,
       stopRadio,
       sendText,
+      sendSignal,
       joinChannel,
       leaveChannel,
       createGroup,
@@ -330,6 +359,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       startRadio,
       stopRadio,
       sendText,
+      sendSignal,
       joinChannel,
       leaveChannel,
       createGroup,

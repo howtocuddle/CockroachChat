@@ -24,7 +24,7 @@ import { concat, fromBase64, fromUtf8, toBase64, toUtf8 } from './bytes';
 // loaded and tested off-device.
 import type { Identity, OpenedMessage, PublicIdentity } from './crypto-core';
 import { open, openWithKey, randomId, seal, sealToKey } from './crypto-core';
-import type { Envelope, MessageBody } from './protocol';
+import type { Envelope, MessageBody, SignalSeverity } from './protocol';
 import {
   DEFAULTS,
   EnvelopeType,
@@ -37,6 +37,7 @@ import {
   pad,
   unpad,
 } from './protocol';
+import { formatSignal } from './signals';
 import type { MeshStore } from './store';
 import type { Peer, Transport } from './transport';
 
@@ -293,6 +294,36 @@ export class MeshEngine {
   }
 
   /**
+   * Broadcasts a preset signal into a channel or public. Same machinery as
+   * sendToChannel; only the body differs. The sender's own copy is recorded with
+   * the same one-line rendering the receiver will show, so both ends read alike.
+   */
+  async sendSignalToChannel(
+    channelId: string,
+    key: Uint8Array,
+    event: string,
+    location: string,
+    severity: SignalSeverity,
+  ): Promise<string> {
+    if (!this.identity) throw new Error('mesh not started');
+
+    const messageId = randomId();
+    const sealed = sealToKey(this.identity, key, this.packSignalBody(event, location, severity));
+
+    await this.recordOutgoing(
+      messageId,
+      `#${channelId}`,
+      formatSignal(event, location, severity),
+      [],
+      severity,
+    );
+    if (this.connected.size > 0) await this.store.setMessageState(messageId, 'sent');
+    await this.inject(sealed);
+
+    return messageId;
+  }
+
+  /**
    * Sends to a closed group by fan-out: one independently sealed copy per
    * member. There is no group key and no shared secret, so the group has no
    * rekeying problem and removing someone is simply not sending to them.
@@ -366,6 +397,16 @@ export class MeshEngine {
   }
 
   /**
+   * Builds a sealed-payload-ready signal body. No message id, ever: a signal is
+   * a channel/broadcast affordance and, like channel text, must never be acked —
+   * an ack would hand every key-holder a per-member read log.
+   */
+  private packSignalBody(event: string, location: string, severity: SignalSeverity): Uint8Array {
+    const body: MessageBody = { kind: 'signal', event, location, severity, sentAt: Date.now() };
+    return pad(toUtf8(encodeBody(body)));
+  }
+
+  /**
    * `expectedFrom` is who this message needs a receipt from before it counts as
    * delivered — empty for the modes that never ack.
    *
@@ -383,6 +424,7 @@ export class MeshEngine {
     conversationId: string,
     text: string,
     expectedFrom: string[],
+    severity?: SignalSeverity,
   ): Promise<void> {
     await this.store.insertMessage({
       id,
@@ -392,6 +434,7 @@ export class MeshEngine {
       text,
       sentAt: Date.now(),
       state: 'queued',
+      severity: severity ?? null,
     });
     await this.store.addExpectedRecipients(id, expectedFrom);
   }
@@ -531,6 +574,39 @@ export class MeshEngine {
         // path we did not offer; the ledger would refuse it anyway, and there
         // is no reason to run it.
         await this.applyReceipt(hit.opened.sender.publicId, parsed.messageId);
+      } else if (parsed?.kind === 'signal' && hit.conversationId !== null) {
+        // A preset situational-awareness signal. decodeBody has already dropped
+        // any forged 'safe'/'all-clear' (danger-monotone), so anything that
+        // reaches here is a genuine danger/caution alert. Rendered into the
+        // message stream as one line; per-severity colour waits on a Message
+        // column and is deliberately not blocking this path.
+        //
+        // Channel/public only — mirrors the send guard. A signal that opened
+        // under our own identity (conversationId === null) was sealed directly
+        // to us, which the sender path never does; we relay it below but never
+        // file it into a one-to-one thread, where a signal is meaningless and
+        // would just be an unsolicited danger-tinted bubble.
+        const conversationId = hit.conversationId;
+        const sender = hit.opened.sender.publicId;
+        await this.store.upsertContact(sender, shortName(sender));
+        const text = formatSignal(parsed.event, parsed.location, parsed.severity);
+        // sentAt is attacker-controlled and the feed sorts on it. A store-and-
+        // forward relay legitimately arrives with a past sentAt, so keep those,
+        // but clamp the future: without this a hostile member pins a forged or
+        // stale alert to the newest slot and buries real ones above it.
+        const sentAt = Math.min(parsed.sentAt, Date.now());
+        await this.store.insertMessage({
+          id: randomId(),
+          peerId: conversationId,
+          senderId: sender,
+          outgoing: false,
+          text,
+          sentAt,
+          state: 'delivered',
+          severity: parsed.severity,
+        });
+        this.onMessage?.(conversationId, sender, text, sentAt);
+        // Never acked: no id in the body, so there is nothing to reply to.
       }
 
       // Still stored and relayed even though it was ours. Dropping it here
